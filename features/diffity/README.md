@@ -1,8 +1,25 @@
-# diffity feature
+# diffity
 
 Opt-in feature that builds [diffity](https://github.com/sdirix/diffity) — an
 agent-driven, GitHub-style diff review UI — from a **pinned git commit**, inside
 the agent image.
+
+## Owner
+
+Stefan Dirix ([sdirix@eclipsesource.com](mailto:sdirix@eclipsesource.com))
+
+## How it is used
+
+Review Git diffs with the agent inside an Enclave session. The agent opens
+diffity views in the contained Chromium; use VNC to view them. The bundled
+skills cover diff reviews, tree views, summaries, and resolving changes.
+GitHub PR reviews and review syncing use `gh` through the `github-cli` feature.
+
+## State
+
+🟢 Used daily and actively maintained. Experimental.
+
+## Install
 
 Install and enable it:
 

@@ -3,6 +3,22 @@
 OpenJDK and Gradle, with Gradle's caches persisted per project. Opt-in
 (disabled by default).
 
+## Owner
+
+Stefan Dirix ([sdirix@eclipsesource.com](mailto:sdirix@eclipsesource.com))
+
+## How it is used
+
+Build Java projects inside Enclave. Use `./gradlew` in projects that have a
+wrapper. It runs the Gradle version the project pins. The installed `gradle`
+covers projects without one, plus `gradle init` and `gradle wrapper`.
+
+## State
+
+🟢 Used daily and actively maintained. Experimental.
+
+## Usage
+
 **Priority**: 70
 
 ```bash
@@ -22,10 +38,6 @@ enclave --features +java-dev
 and verifies it against a pinned SHA-256. Bump `GRADLE_VERSION` and
 `GRADLE_SHA256` together. Gradle publishes the checksum at
 `https://services.gradle.org/distributions/gradle-<version>-bin.zip.sha256`.
-
-Use `./gradlew` in projects that have a wrapper. It runs the Gradle version the
-project pins. The installed `gradle` covers projects without one, plus
-`gradle init` and `gradle wrapper`.
 
 `JAVA_HOME` is `/usr/lib/jvm/default-java`, the arch-independent symlink
 `default-jre-headless` ships. It is container environment, so `docker exec`
