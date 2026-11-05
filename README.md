@@ -1,110 +1,90 @@
-# Enclave Extensions
+# EclipseSource Enclave Extensions
 
-Community tool and feature extensions for [Eclipse Enclave](https://github.com/eclipse-enclave/enclave),
-the Docker sandbox for agentic coding tools.
+A collection of extensions for [Eclipse Enclave](https://github.com/eclipse-enclave/enclave)
+that we use at EclipseSource.
 
-Enclave ships Claude, Codex, OpenCode, Theia, and a handful of features in its
-own repository. This repo is for everything that lives outside it: experimental
-agents or features, or extensions that are too niche to be built in.
+The goal is **not** to maintain polished, production-ready extensions, but to share what we build for ourselves so that others can:
+
+- **discover** extensions that might solve a problem they have,
+- **adapt** them to their own needs, or
+- **get inspired** to build something similar.
+
+There are no promises of long-term maintenance or support. Every extension is shared as-is.
+
+## Structure
+
+```text
+features/  Optional sandbox capabilities (kind: mixin)
+tools/     Runnable sandbox tools (kind: sandbox)
+commands/  Host-only commands (kind: command)
+```
+
+Each extension lives in `<kind>/<name>/` with its own `spec.yaml` and
+`README.md`.
 
 ## Install
 
-Enclave installs extensions straight from a git repository.
+Install an extension by name with the command for its type:
 
 ```bash
-enclave tools add eclipsesource/enclave-extensions
+enclave tools add eclipsesource/enclave-extensions --name <name>
+enclave features add eclipsesource/enclave-extensions --name <name>
+enclave commands add eclipsesource/enclave-extensions --name <name>
 ```
 
-With more than one tool in the repo, `add` lists what it found and asks which
-one you meant. Skip the question by naming it:
+See the extension's README for requirements and usage, and Enclave's
+[installation guide](https://github.com/eclipse-enclave/enclave/blob/main/docs/extensions/installing.md)
+for more options.
 
-```bash
-enclave tools add eclipsesource/enclave-extensions --name <extension-name>
-enclave --tool <extension-name>
-```
+## Trust and maturity
 
-Features work the same way:
+Extensions may be experimental, specific to a use case, or have rough edges.
+Check the extension's README for requirements, credentials, network access,
+persistence, and limitations. Read the installer's capability summary before
+installing or updating. Host commands run outside the sandbox with your user
+privileges. Tools and features may also run code during container builds and
+startup.
 
-```bash
-enclave features add eclipsesource/enclave-extensions --name <extension-name>
-enclave --features +<extension-name>
-```
+## Contributing
 
-Before writing anything, `add` prints what the extension can do: root install
-steps, install and startup scripts, network changes, declared credentials,
-files seeded into your project. Read that summary. An extension is code that
-runs at container build and start time. Proceed at your own risk, extensions
-here are not signed or are not reviewed or tested in depth by Eclipse Enclave
-core team.
+Any ES employee can add an extension. No proposal is needed. Keep it small and
+practical. Put it in the directory for its type and include a README with:
 
-Afterwards:
+1. A short description of what it does.
+2. How you use it: the problem it solves and where it fits in your workflow.
+3. The owner's name and contact details or GitHub handle.
+4. Its maintenance state:
+   - 🟢 Used daily and actively maintained
+   - 🟡 Occasionally used, may receive updates
+   - 🔵 Ad-hoc (built for a one-time task, not expected to be updated)
+   - ⚫ Archived (no longer used or maintained)
+5. Enough instructions to install and run it, including requirements and any
+   relevant credentials, network access, persistence, or known limitations.
 
-```bash
-enclave tools list                     # built-in and installed, with provenance
-enclave tools update <extension-name>  # refresh from the recorded source
-enclave tools remove <extension-name>
-```
+### Ownership and pull requests
 
-If `enclave tools --help` has no `add` subcommand, your Enclave predates the
-installer. Update from the
-[rolling release](https://github.com/eclipse-enclave/enclave/releases/tag/rolling).
+The owner listed in the extension's README is the point of contact. This does
+not come with a commitment to provide support.
 
-Alternatively, you can skip the installer entirely: download or clone this
-repository yourself and copy the individual `tools/<name>/` or
-`features/<name>/` directories you want (not necessarily all of them) into
-the matching `tools/` or `features/` subdirectory of
-`~/.config/enclave/extensions/`. This gets you the same extensions without
-provenance tracking or update checks. See Enclave's [extension
-docs](https://github.com/eclipse-enclave/enclave/tree/main/docs/extensions)
-for more information.
+- Open a PR for a new extension or an update to one you own. You can merge it
+  yourself without additional review.
+- If a PR changes someone else's extension code, get that owner's approval
+  before merging. For changes spanning several owners, ask each affected owner.
 
-## What is in here
+We follow these rules by agreement, without automated enforcement.
 
-| Tool | Status | What it is |
-|------|--------|------------|
-| [openclaw](tools/openclaw) | Experimental | [OpenClaw](https://openclaw.ai/) personal assistant: gateway, terminal UI, and browser dashboard |
-| [dsh](tools/dsh) | Experimental | [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) with its browser UI |
+### Extension layout
 
-| Feature | Status | What it is |
-|---------|--------|------------|
-| [diffity](features/diffity) | Experimental | [diffity](https://github.com/sdirix/diffity) agent-driven diff review UI, built from a pinned commit in the image |
-| [java-dev](features/java-dev) | Experimental | OpenJDK from Debian and a pinned Gradle, with Gradle's caches persisted per project |
+- Put tools in `tools/<name>/` with `kind: sandbox`.
+- Put features in `features/<name>/` with `kind: mixin`.
+- Put host-only extensions in `commands/<name>/` with `kind: command`.
+- Match the directory name to the spec's `name`.
+- Command specs contain metadata only. Put executable commands in
+  `commands/host/<command-name>` within the extension, and preserve their
+  executable bits. They do not install anything into a sandbox image.
 
-diffity serves on container-local loopback only. Viewing its UI needs the
-[vnc](https://github.com/eclipse-enclave/enclave-extensions/tree/main/features/vnc)
-feature from eclipse-enclave/enclave-extensions alongside it.
-
-Experimental means what it says: each one pins a fast-moving upstream, gets
-thinner testing than a built-in tool, and has rough edges written down in its
-own README. Read that README before the first session, the security notes
-above all.
-
-## Contribute
-
-Bring your favorite agent or enclave feature. A tool extension is a directory with a
-`spec.yaml` and usually an `install.sh`. A feature extension can be as small as a spec
-and a package list.
-
-- Tools live in `tools/<name>/` and declare `kind: sandbox`.
-- Features live in `features/<name>/` and declare `kind: mixin`.
-- The directory name must match the spec's `name`.
-- Every extension needs a `README.md` that covers credentials, egress,
-  persistence, and whatever does not work.
-
-Start from Enclave's guide to
-[adding a tool](https://github.com/eclipse-enclave/enclave/blob/main/docs/extensions/adding-a-tool.md)
-and the [extension reference](https://github.com/eclipse-enclave/enclave/blob/main/docs/extensions/README.md),
-try it locally with `enclave tools add ./path/to/clone --name <name>`, then open
-a pull request. Also rough extensions marked experimental are welcome. But please make
-sure to properly document the state of your extension and its edges.
-
-## Questions & Support
-
-Got a question, an idea, or ran into trouble with one of these extensions?
-Head over to
-[Enclave's discussions](https://github.com/eclipse-enclave/enclave/discussions)
-and start a thread. It's the best place for support, feature requests, and
-just chatting about what you're building.
+See Enclave's [extension reference](https://github.com/eclipse-enclave/enclave/blob/main/docs/extensions/README.md)
+and [installation guide](https://github.com/eclipse-enclave/enclave/blob/main/docs/extensions/installing.md).
 
 ## License
 
