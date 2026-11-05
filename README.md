@@ -23,6 +23,13 @@ enclave tools add eclipsesource/enclave-extensions --name <extension-name>
 enclave --tool <extension-name>
 ```
 
+Features work the same way:
+
+```bash
+enclave features add eclipsesource/enclave-extensions --name <extension-name>
+enclave --features +<extension-name>
+```
+
 Before writing anything, `add` prints what the extension can do: root install
 steps, install and startup scripts, network changes, declared credentials,
 files seeded into your project. Read that summary. An extension is code that
@@ -57,6 +64,15 @@ for more information.
 |------|--------|------------|
 | [openclaw](tools/openclaw) | Experimental | [OpenClaw](https://openclaw.ai/) personal assistant: gateway, terminal UI, and browser dashboard |
 | [dsh](tools/dsh) | Experimental | [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) with its browser UI |
+
+| Feature | Status | What it is |
+|---------|--------|------------|
+| [diffity](features/diffity) | Experimental | [diffity](https://github.com/sdirix/diffity) agent-driven diff review UI, built from a pinned commit in the image |
+| [java-dev](features/java-dev) | Experimental | OpenJDK from Debian and a pinned Gradle, with Gradle's caches persisted per project |
+
+diffity serves on container-local loopback only. Viewing its UI needs the
+[vnc](https://github.com/eclipse-enclave/enclave-extensions/tree/main/features/vnc)
+feature from eclipse-enclave/enclave-extensions alongside it.
 
 Experimental means what it says: each one pins a fast-moving upstream, gets
 thinner testing than a built-in tool, and has rough edges written down in its
