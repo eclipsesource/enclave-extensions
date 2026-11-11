@@ -58,7 +58,7 @@ arguments. Rules live in $(pretty "$presets_file").
   --use <name>      Preset to use or save (default: default)
   --save            Save the flags for this path, or in a git repository for
                     this path or all worktrees of the repository, then exit
-  --save=path|repo  Save without asking
+  --save=path|repo  Like --save, but skip the path or repository question
   --show            Print the matching rules and the resulting command
 
 For a preset, the most specific matching rule that defines it wins: exact
@@ -98,11 +98,13 @@ is_pattern() {
     esac
 }
 
+# The replacement sits in a variable, as bash before 4.3 does no quote removal
+# on the replacement of a double-quoted ${a//pat/rep}.
 quote_args() {
-    local a out=""
+    local a out="" q="'\\''"
     for a in "$@"; do
         case $a in
-            '' | *[!A-Za-z0-9_+,./:=@%^-]*) a="'${a//\'/\'\\\'\'}'" ;;
+            '' | *[!A-Za-z0-9_+,./:=@%^-]*) a="'${a//\'/$q}'" ;;
         esac
         out+=" $a"
     done
@@ -444,14 +446,16 @@ write_preset() {
 }
 
 save() {
-    local target tier same=-1 j k result
+    local target tier same=-1 j k result error
     ((${#args[@]} > 0)) || die "nothing to save, pass the enclave flags to save"
     check_flags "${args[@]}"
     # enclave config exits 0 for flags that parse but fail validation.
     result=$("$enclave_bin" config --json "${args[@]}") ||
         die "not saved, enclave rejected the flags"
-    jq -e '.valid == true' <<<"$result" >/dev/null ||
-        die "not saved, enclave rejected the flags: $(jq -r '.error // "no details"' <<<"$result" 2>/dev/null)"
+    if ! jq -e '.valid == true' <<<"$result" >/dev/null 2>&1; then
+        error=$(jq -r '.error // empty' <<<"$result" 2>/dev/null) || error=""
+        die "not saved, enclave rejected the flags${error:+: $error}"
+    fi
 
     if [[ -z $repo_dir ]]; then
         if [[ -n $repo_issue ]]; then
@@ -520,6 +524,13 @@ set_mode() {
     mode=$1
 }
 
+# Only a first-position --help is ours. Later ones reach enclave, so
+# enclave preset shell --help shows the help of enclave shell.
+if [[ ${1:-} == -h || ${1:-} == --help ]]; then
+    usage
+    exit 0
+fi
+
 while (($# > 0)); do
     case $1 in
         --)
@@ -543,10 +554,6 @@ while (($# > 0)); do
             ;;
         --save=*) die "invalid $1 (valid: --save=path, --save=repo)" ;;
         --show) set_mode show ;;
-        -h | --help)
-            usage
-            exit 0
-            ;;
         *) args+=("$1") ;;
     esac
     shift
