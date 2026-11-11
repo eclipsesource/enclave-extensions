@@ -1,0 +1,565 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 EclipseSource GmbH and others.
+#
+# This program and the accompanying materials are made available under the
+# terms of the MIT License, which is available in the project root.
+#
+# SPDX-License-Identifier: MIT
+
+# `enclave preset`: runs enclave with the flags saved for the current
+# directory in presets.json. A rule matches a directory path or a git
+# repository, so one repository rule covers all of its worktrees.
+#
+# Written for bash 3.2, the /bin/bash of macOS: no mapfile, no associative
+# arrays, and possibly empty arrays expand as ${a[@]+"${a[@]}"} under set -u.
+
+set -euo pipefail
+
+die() {
+    printf 'preset: %s\n' "$*" >&2
+    exit 1
+}
+
+info() {
+    printf 'preset: %s\n' "$*" >&2
+}
+
+[[ -n ${ENCLAVE_CONFIG_DIR:-} ]] || die "run this as enclave preset"
+command -v jq >/dev/null 2>&1 ||
+    die "jq is required (Debian/Ubuntu: apt install jq, macOS: brew install jq)"
+
+enclave_bin=${ENCLAVE_BIN:-enclave}
+presets_file=$ENCLAVE_CONFIG_DIR/presets.json
+lock_dir=$presets_file.lock
+logical_dir=${ENCLAVE_PROJECT_ROOT:-$PWD}
+physical_dir=$(CDPATH='' cd -- "$logical_dir" && pwd -P) ||
+    die "cannot resolve $logical_dir"
+
+# The ~ in these patterns and outputs is a literal, not a tilde expansion.
+# shellcheck disable=SC2088
+pretty() {
+    case $1 in
+        "$HOME") printf '%s\n' '~' ;;
+        "$HOME"/*) printf '~/%s\n' "${1#"$HOME"/}" ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+usage() {
+    cat <<EOF
+Usage:
+  enclave preset [--use <name>] [enclave args...]
+  enclave preset --save[=path|repo] [--use <name>] <enclave flags...>
+  enclave preset --show [--use <name>] [enclave args...]
+
+Runs enclave with the flags saved for this directory, followed by the given
+arguments. Rules live in $(pretty "$presets_file").
+
+  --use <name>      Preset to use or save (default: default)
+  --save            Save the flags for this path, or in a git repository for
+                    this path or all worktrees of the repository, then exit
+  --save=path|repo  Save without asking
+  --show            Print the matching rules and the resulting command
+
+For a preset, the most specific matching rule that defines it wins: exact
+path, then exact repository, then patterns in file order. A * in a pattern
+also matches /.
+
+  {"rules": [
+    {"repo": "~/src/app", "presets": {
+      "default": ["--features", "+java-dev"],
+      "ui": ["--features", "+java-dev,+vnc"]}},
+    {"path": "~/src/scratch/*", "presets": {"default": ["--tool", "codex"]}}
+  ]}
+EOF
+}
+
+expand() {
+    local p=$1
+    # shellcheck disable=SC2088
+    case $p in
+        '~') p=$HOME ;;
+        '~/'*) p=$HOME/${p#'~/'} ;;
+    esac
+    [[ $p == / ]] || p=${p%/}
+    printf '%s\n' "$p"
+}
+
+canonical() {
+    (CDPATH='' cd -- "$1" 2>/dev/null && pwd -P) || printf '%s\n' "$1"
+}
+
+# A rule value with *, ?, or [ is a pattern, unless it names an existing
+# directory, such as one --save wrote for a directory with these characters.
+is_pattern() {
+    case $1 in
+        *[*?[]*) [[ ! -d $1 ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+quote_args() {
+    local a out=""
+    for a in "$@"; do
+        case $a in
+            '' | *[!A-Za-z0-9_+,./:=@%^-]*) a="'${a//\'/\'\\\'\'}'" ;;
+        esac
+        out+=" $a"
+    done
+    printf '%s\n' "${out# }"
+}
+
+confirm() {
+    local reply
+    [[ -t 0 ]] || die "not saved, confirmation needs a terminal"
+    read -r -p "$1 [y/N] " reply || true
+    [[ $reply == [yY] || $reply == [yY][eE][sS] ]]
+}
+
+# Rejects what a preset must not contain: options enclave never reads from a
+# config file, flags only enclave config accepts, which --save validates with,
+# and the tool argument separator, which would turn every flag typed after the
+# preset into a tool argument.
+check_flags() {
+    local a
+    for a in "$@"; do
+        case ${a%%=*} in
+            --) die "presets cannot contain --" ;;
+            --view | --json) die "${a%%=*} is an enclave config flag, not a session flag" ;;
+            --rebuild | --no-rebuild | --force-base-image | --name | --build-uid | --build-gid | \
+                --runtime-uid-remap | --buildx-cache-* | --allow-root | --allow-sensitive-mounts | \
+                --add-sensitive-dir | --add-readonly-sensitive-dir)
+                die "${a%%=*} is CLI-only in enclave and not allowed in presets" ;;
+        esac
+    done
+}
+
+# --- rules --------------------------------------------------------------------
+
+# shellcheck disable=SC2016
+shape_filter='
+type == "object" and ((.rules // []) as $rules
+| ($rules | type) == "array"
+  and all($rules[];
+    type == "object"
+    and ([has("path"), has("repo")] | map(select(.)) | length) == 1
+    and ((.path // .repo) | type == "string" and . != "")
+    and (.presets | type == "object")
+    and all(.presets[]; type == "array" and all(.[]; type == "string"))))'
+
+rule_kinds=()
+rule_patterns=()
+
+# Prints the rules file prefixed with +, or nothing when it does not exist.
+snapshot() {
+    [[ -f $presets_file ]] || return 0
+    printf '+'
+    cat "$presets_file"
+}
+
+# Every query runs on the file as read here, and --save writes only if the
+# file is still unchanged, so rule indexes stay valid across its prompts.
+loaded=""
+rules_json=""
+
+load_rules() {
+    local kind pattern
+    loaded=$(snapshot) || die "cannot read $(pretty "$presets_file")"
+    [[ -n $loaded ]] || return 0
+    rules_json=${loaded#+}
+    jq empty <<<"$rules_json" || die "cannot parse $(pretty "$presets_file")"
+    jq -e "$shape_filter" <<<"$rules_json" >/dev/null ||
+        die "unexpected structure in $(pretty "$presets_file"), see enclave preset --help"
+    while IFS=$'\t' read -r kind pattern; do
+        rule_kinds+=("$kind")
+        rule_patterns+=("$pattern")
+    done < <(jq -r '(.rules // [])[] | if has("path") then "path\t\(.path)" else "repo\t\(.repo)" end' <<<"$rules_json")
+}
+
+rule_desc() {
+    printf '%s %s\n' "${rule_kinds[$1]}" "${rule_patterns[$1]}"
+}
+
+has_preset() {
+    jq -e --argjson i "$1" --arg p "$2" '.rules[$i].presets | has($p)' <<<"$rules_json" >/dev/null
+}
+
+preset_names() {
+    jq -r --argjson i "$1" '.rules[$i].presets | keys_unsorted | join(", ")' <<<"$rules_json"
+}
+
+preset_args=()
+
+read_preset() {
+    local a
+    preset_args=()
+    while IFS= read -r -d '' a; do
+        preset_args+=("$a")
+    done < <(jq -j --argjson i "$1" --arg p "$2" '.rules[$i].presets[$p][] | (., "\u0000")' <<<"$rules_json")
+}
+
+# --- matching -----------------------------------------------------------------
+
+repo_dir=""
+repo_issue=""
+linked_worktree=false
+
+abs_dir() {
+    case $1 in
+        /*) canonical "$1" ;;
+        *) canonical "$physical_dir/$1" ;;
+    esac
+}
+
+# Runs git without repository variables such as GIT_DIR from the environment.
+git_clean() {
+    (
+        while IFS= read -r v; do
+            unset "$v"
+        done < <(git rev-parse --local-env-vars 2>/dev/null)
+        exec git "$@"
+    )
+}
+
+# True when directory $1 is the project directory or one of its parents.
+contains_project() {
+    [[ $1 == / || $physical_dir == "$1" || $physical_dir == "$1"/* ]]
+}
+
+# Prints the path in the first line of file $1, made absolute against
+# directory $2 and canonical up to its last component.
+read_path_file() {
+    local line=""
+    [[ -f $1 ]] || return 1
+    IFS= read -r line <"$1" || [[ -n $line ]] || return 1
+    case $line in /*) ;; *) line=$2/$line ;; esac
+    printf '%s/%s\n' "$(canonical "$(dirname "$line")")" "$(basename "$line")"
+}
+
+# The repository is identified by its common git directory, which all of its
+# worktrees share. A trailing /.git is dropped, so a regular repository is
+# named by its main worktree.
+#
+# The session can write the project directory, including a .git there that
+# points git at any other repository. So the answer counts only when the
+# repository side confirms it: the git directory is in the project directory
+# or a parent, or the repository lists a worktree there.
+resolve_repo() {
+    local out git_dir common back=""
+    out=$(git_clean -C "$physical_dir" rev-parse --git-dir --git-common-dir 2>/dev/null) || return 0
+    git_dir=$(abs_dir "${out%%$'\n'*}")
+    common=$(abs_dir "${out#*$'\n'}")
+    if [[ $git_dir == "$common" ]]; then
+        if ! contains_project "${git_dir%/.git}"; then
+            repo_issue="$(pretty "$git_dir") is outside this directory and its parents"
+            return 0
+        fi
+    else
+        if [[ ${git_dir%/*} == "$common/worktrees" ]]; then
+            back=$(read_path_file "$git_dir/gitdir" "$git_dir") || back=""
+        fi
+        if [[ $back != */.git ]] || ! contains_project "${back%/.git}"; then
+            repo_issue="$(pretty "$common") lists no worktree here"
+            return 0
+        fi
+        linked_worktree=true
+    fi
+    repo_dir=${common%/.git}
+}
+
+# Prints 1 (exact path), 2 (exact repository), or 3 (pattern) when rule $1
+# matches this directory, nothing otherwise. A * in a pattern also matches /.
+rule_tier() {
+    local pattern
+    pattern=$(expand "${rule_patterns[$1]}")
+    # Unquoted right-hand sides are the glob matches.
+    # shellcheck disable=SC2053
+    if [[ ${rule_kinds[$1]} == path ]]; then
+        if is_pattern "$pattern"; then
+            [[ $physical_dir == $pattern || $logical_dir == $pattern ]] && echo 3
+        else
+            [[ $physical_dir == "$(canonical "$pattern")" || $logical_dir == "$pattern" ]] && echo 1
+        fi
+    elif [[ -n $repo_dir ]]; then
+        if is_pattern "$pattern"; then
+            [[ $repo_dir == $pattern ]] && echo 3
+        else
+            [[ $repo_dir == "$(canonical "$pattern")" ]] && echo 2
+        fi
+    fi
+    return 0
+}
+
+match_idx=()
+match_tier=()
+
+# Fills match_idx and match_tier with the matching rules, most specific first,
+# file order within a tier.
+match_rules() {
+    local tiers=() tier i n=${#rule_kinds[@]}
+    i=0
+    while ((i < n)); do
+        tiers+=("$(rule_tier "$i")")
+        i=$((i + 1))
+    done
+    for tier in 1 2 3; do
+        i=0
+        while ((i < n)); do
+            if [[ ${tiers[$i]} == "$tier" ]]; then
+                match_idx+=("$i")
+                match_tier+=("$tier")
+            fi
+            i=$((i + 1))
+        done
+    done
+}
+
+chosen=""
+
+select_rule() {
+    local i
+    chosen=""
+    for i in ${match_idx[@]+"${match_idx[@]}"}; do
+        if has_preset "$i" "$1"; then
+            chosen=$i
+            return 0
+        fi
+    done
+}
+
+# --- modes --------------------------------------------------------------------
+
+run() {
+    select_rule "$preset"
+    if [[ -z $chosen ]]; then
+        if $preset_given; then
+            die "no rule for $(pretty "$physical_dir") defines preset $preset"
+        fi
+        info "no saved flags for $(pretty "$physical_dir")"
+        exec "$enclave_bin" ${args[@]+"${args[@]}"}
+    fi
+    read_preset "$chosen" "$preset"
+    check_flags ${preset_args[@]+"${preset_args[@]}"}
+    info "$(rule_desc "$chosen") [$preset]: $(quote_args ${preset_args[@]+"${preset_args[@]}"})"
+    exec "$enclave_bin" ${preset_args[@]+"${preset_args[@]}"} ${args[@]+"${args[@]}"}
+}
+
+show() {
+    local i suffix=""
+    $linked_worktree && suffix=" (worktree)"
+    printf 'file     %s\n' "$(pretty "$presets_file")"
+    printf 'project  %s%s\n' "$(pretty "$physical_dir")" "$suffix"
+    [[ -z $repo_dir ]] || printf 'repo     %s\n' "$(pretty "$repo_dir")"
+    [[ -z $repo_issue ]] || printf 'repo     ignored, %s\n' "$repo_issue"
+    for i in ${match_idx[@]+"${match_idx[@]}"}; do
+        printf 'match    %s: %s\n' "$(rule_desc "$i")" "$(preset_names "$i")"
+    done
+    select_rule "$preset"
+    if [[ -z $chosen ]]; then
+        printf '%-8s not defined\n' "$preset"
+        return 0
+    fi
+    read_preset "$chosen" "$preset"
+    printf '%-8s %s\n' "$preset" "$(quote_args "$(basename "$enclave_bin")" \
+        ${preset_args[@]+"${preset_args[@]}"} ${args[@]+"${args[@]}"})"
+}
+
+ask_scope() {
+    local reply
+    if $linked_worktree; then
+        info "$(pretty "$physical_dir") is a worktree of $(pretty "$repo_dir")"
+    fi
+    printf 'Save preset %s for\n  1) this path: %s\n  2) all worktrees of %s\n' \
+        "$preset" "$(pretty "$physical_dir")" "$(pretty "$repo_dir")" >&2
+    read -r -p 'Choice [2]: ' reply || true
+    case ${reply:-2} in
+        1) scope=path ;;
+        2) scope=repo ;;
+        *) die "invalid choice: $reply" ;;
+    esac
+}
+
+tmp_file=""
+locked=false
+
+cleanup() {
+    [[ -z $tmp_file ]] || rm -f "$tmp_file"
+    if $locked; then
+        rmdir "$lock_dir" 2>/dev/null || true
+    fi
+}
+
+# Serializes writers. The lock is held only to compare and replace the file.
+lock() {
+    local n=0
+    until mkdir "$lock_dir" 2>/dev/null; do
+        n=$((n + 1))
+        ((n < 50)) || die "not saved, $(pretty "$lock_dir") exists, remove it if no save is running"
+        sleep 0.1
+    done
+    locked=true
+}
+
+# Prints the file a chain of symlinks ends at, so replacing that file keeps
+# the links.
+resolve_links() {
+    local f=$1 n=0
+    while [[ -L $f ]]; do
+        ((n < 40)) || return 1
+        case $(readlink "$f") in
+            /*) f=$(readlink "$f") ;;
+            *) f=$(dirname "$f")/$(readlink "$f") ;;
+        esac
+        n=$((n + 1))
+    done
+    printf '%s\n' "$f"
+}
+
+write_preset() {
+    local same=$1 kind=$2 value=$3 a args_json updated target
+    shift 3
+    args_json=$(for a in "$@"; do jq -n --arg v "$a" '$v'; done | jq -cs .)
+    updated=$(if [[ -n $loaded ]]; then printf '%s\n' "$rules_json"; else printf '{}\n'; fi |
+        jq --argjson i "$same" --arg kind "$kind" --arg value "$value" \
+            --arg name "$preset" --argjson args "$args_json" '
+            .rules //= []
+            | if $i >= 0 then .rules[$i].presets[$name] = $args
+              else .rules += [{($kind): $value, presets: {($name): $args}}] end') ||
+        die "not saved, cannot update $(pretty "$presets_file")"
+
+    trap cleanup EXIT
+    trap 'exit 130' INT TERM HUP
+    mkdir -p "$ENCLAVE_CONFIG_DIR"
+    lock
+    [[ $(snapshot) == "$loaded" ]] ||
+        die "not saved, $(pretty "$presets_file") changed meanwhile, run --save again"
+    target=$(resolve_links "$presets_file") ||
+        die "not saved, too many symlinks at $(pretty "$presets_file")"
+    tmp_file=$(mktemp "$(dirname "$target")/.presets.XXXXXX") ||
+        die "not saved, cannot write next to $(pretty "$target")"
+    printf '%s\n' "$updated" >"$tmp_file" ||
+        die "not saved, cannot write $(pretty "$tmp_file")"
+    mv -f "$tmp_file" "$target" || die "not saved, cannot replace $(pretty "$target")"
+    tmp_file=""
+}
+
+save() {
+    local target tier same=-1 j k result
+    ((${#args[@]} > 0)) || die "nothing to save, pass the enclave flags to save"
+    check_flags "${args[@]}"
+    # enclave config exits 0 for flags that parse but fail validation.
+    result=$("$enclave_bin" config --json "${args[@]}") ||
+        die "not saved, enclave rejected the flags"
+    jq -e '.valid == true' <<<"$result" >/dev/null ||
+        die "not saved, enclave rejected the flags: $(jq -r '.error // "no details"' <<<"$result" 2>/dev/null)"
+
+    if [[ -z $repo_dir ]]; then
+        if [[ -n $repo_issue ]]; then
+            [[ $scope != repo ]] || die "repository ignored, $repo_issue"
+            info "repository ignored, $repo_issue"
+        elif [[ $scope == repo ]]; then
+            die "$(pretty "$physical_dir") is not in a git repository"
+        fi
+        scope=path
+    elif [[ -z $scope ]]; then
+        [[ -t 0 ]] || die "pass --save=path or --save=repo"
+        ask_scope
+    fi
+    if [[ $scope == path ]]; then
+        target=$physical_dir
+        tier=1
+    else
+        target=$repo_dir
+        tier=2
+    fi
+
+    # The rule saved for this target is the first exact match of its tier.
+    k=0
+    while ((k < ${#match_idx[@]})); do
+        if ((match_tier[k] == tier)); then
+            same=${match_idx[$k]}
+            break
+        fi
+        k=$((k + 1))
+    done
+
+    if ((same >= 0)) && has_preset "$same" "$preset"; then
+        read_preset "$same" "$preset"
+        info "$(rule_desc "$same") [$preset] is: $(quote_args ${preset_args[@]+"${preset_args[@]}"})"
+        confirm "Replace?" || die "not saved"
+    fi
+
+    k=0
+    while ((k < ${#match_idx[@]})); do
+        j=${match_idx[$k]}
+        if ((j != same)) && has_preset "$j" "$preset"; then
+            if ((match_tier[k] < tier)); then
+                info "$(rule_desc "$j") [$preset] takes precedence here"
+                confirm "Save anyway?" || die "not saved"
+            else
+                info "overrides $(rule_desc "$j") [$preset] here"
+            fi
+        fi
+        k=$((k + 1))
+    done
+
+    write_preset "$same" "$scope" "$(pretty "$target")" "${args[@]}"
+    info "saved $scope $(pretty "$target") [$preset]: $(quote_args "${args[@]}")"
+}
+
+# --- main ---------------------------------------------------------------------
+
+mode=run
+preset=default
+preset_given=false
+scope=""
+args=()
+
+set_mode() {
+    [[ $mode == run || $mode == "$1" ]] || die "--save and --show are exclusive"
+    mode=$1
+}
+
+while (($# > 0)); do
+    case $1 in
+        --)
+            args+=("$@")
+            break
+            ;;
+        --use)
+            (($# > 1)) || die "--use requires a name"
+            preset=$2
+            preset_given=true
+            shift
+            ;;
+        --use=*)
+            preset=${1#*=}
+            preset_given=true
+            ;;
+        --save) set_mode save ;;
+        --save=path | --save=repo)
+            set_mode save
+            scope=${1#*=}
+            ;;
+        --save=*) die "invalid $1 (valid: --save=path, --save=repo)" ;;
+        --show) set_mode show ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *) args+=("$1") ;;
+    esac
+    shift
+done
+
+[[ $preset =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid preset name: $preset"
+
+load_rules
+resolve_repo
+match_rules
+
+case $mode in
+    run) run ;;
+    show) show ;;
+    save) save ;;
+esac
