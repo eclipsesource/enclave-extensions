@@ -17,6 +17,7 @@ There are no promises of long-term maintenance or support. Every extension is sh
 features/  Optional sandbox capabilities (kind: mixin)
 tools/     Runnable sandbox tools (kind: sandbox)
 commands/  Host-only commands (kind: command)
+filters/   API request filters enforced by the gateway (kind: filter)
 ```
 
 Each extension lives in `<kind>/<name>/` with its own `spec.yaml` and
@@ -30,6 +31,15 @@ Install an extension by name with the command for its type:
 enclave tools add eclipsesource/enclave-extensions --name <name>
 enclave features add eclipsesource/enclave-extensions --name <name>
 enclave commands add eclipsesource/enclave-extensions --name <name>
+enclave filters add eclipsesource/enclave-extensions --name <name>
+```
+
+Some extensions come in pairs. The `gws` filter governs the Google Workspace
+APIs that the `gws` feature's CLI calls:
+
+```bash
+enclave filters add eclipsesource/enclave-extensions --name gws
+enclave features add eclipsesource/enclave-extensions --name gws
 ```
 
 See the extension's README for requirements and usage, and Enclave's
@@ -43,7 +53,8 @@ Check the extension's README for requirements, credentials, network access,
 persistence, and limitations. Read the installer's capability summary before
 installing or updating. Host commands run outside the sandbox with your user
 privileges. Tools and features may also run code during container builds and
-startup.
+startup. Filters decide which API requests the gateway sends with your
+credential. Read a filter's security notes before using its presets.
 
 ## Contributing
 
@@ -78,6 +89,8 @@ We follow these rules by agreement, without automated enforcement.
 - Put tools in `tools/<name>/` with `kind: sandbox`.
 - Put features in `features/<name>/` with `kind: mixin`.
 - Put host-only extensions in `commands/<name>/` with `kind: command`.
+- Put request filters in `filters/<name>/` with `kind: filter`. Filters are
+  data only: `spec.yaml`, `presets/<preset>.yaml`, and the README.
 - Match the directory name to the spec's `name`.
 - Command specs contain metadata only. Put executable commands in
   `commands/host/<command-name>` within the extension, and preserve their

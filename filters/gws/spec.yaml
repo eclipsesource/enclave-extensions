@@ -1,0 +1,1477 @@
+# Copyright (C) 2026 EclipseSource GmbH and others.
+#
+# This program and the accompanying materials are made available under the
+# terms of the MIT License, which is available in the project root.
+#
+# SPDX-License-Identifier: MIT
+
+# Routes follow the Google discovery documents (rootUrl, servicePath, method
+# httpMethod and flatPath) for gmail/v1, drive/v3, calendar/v3, docs/v1,
+# sheets/v4, slides/v1, and people/v1, revisions 20261106 to 20261111, and the
+# requests gws 0.22.5 sends. Routes match in order and the first match wins.
+# Anything without a route is denied. Routes with action deny name the
+# dangerous operations, so their denials explain why. SECURITY.md explains the
+# decisions.
+#
+# A query parameter or JSON key matches a condition by its exact name or its
+# snake_case alias, so a condition on addParents also covers add_parents.
+# Other spellings of a checked name, such as AddParents, are denied. Route
+# hosts match exactly. Subdomains of a governed host are governed too and have
+# no routes, so they are denied.
+#
+# Write routes list the JSON keys they allow with jsonAllowedKeys, such as
+# the batch request kinds of Docs, Sheets, and Slides and the File fields of
+# Drive. A key Google adds later matches no allow route. Bodies that routes read must
+# be JSON objects sent as JSON, so JSPB (application/json+protobuf) is denied.
+#
+# Edits must not make Google read another file or fetch a URL, since that
+# reads past the files.read checks or sends data out. Deny routes catch those
+# requests and fields anywhere in a body with recursive descent (..name),
+# before the allow route of the same operation, so their denials explain why.
+# Uploads that Drive converts are not inspected, so they have their own
+# capabilities, files.replace and files.import, which no shipped preset
+# enables.
+
+schemaVersion: "1"
+kind: filter
+name: gws
+displayName: Google Workspace
+description: Gmail, Calendar, Drive, Docs, Sheets, and Slides through the gws CLI
+defaultPreset: readonly
+# Google reads snake_case JSON keys as their lowerCamelCase field, so
+# {"writers_can_share": true} must not slip past a condition on
+# writersCanShare.
+jsonKeys: protobuf
+
+hosts:
+  - www.googleapis.com # Drive, Calendar, discovery, Drive uploads
+  - gmail.googleapis.com
+  - docs.googleapis.com
+  - sheets.googleapis.com
+  - slides.googleapis.com
+  - people.googleapis.com # display name for the From header of gws +send
+  - oauth2.googleapis.com # no routes, so the container cannot mint tokens
+# Tool allowlists include googleapis.com, where Google APIs this filter does
+# not govern accept a token the agent brings. Confining it blocks them.
+confine: [googleapis.com]
+
+credential:
+  oauth2:
+    authUrl: https://accounts.google.com/o/oauth2/auth
+    tokenUrl: https://oauth2.googleapis.com/token
+    revokeUrl: https://oauth2.googleapis.com/revoke
+    authParams: { access_type: offline, prompt: consent }
+    scopePrefix: "https://www.googleapis.com/auth/"
+    # Fully expanded, so coverage does not depend on transitive lookups.
+    # Includes broader scopes that imported grants may carry.
+    scopeImplies:
+      "https://mail.google.com/":
+        [gmail.modify, gmail.compose, gmail.readonly, gmail.metadata, gmail.send, gmail.drafts, gmail.drafts.create]
+      gmail.modify: [gmail.compose, gmail.readonly, gmail.metadata, gmail.send, gmail.drafts, gmail.drafts.create]
+      gmail.compose: [gmail.send, gmail.drafts, gmail.drafts.create]
+      gmail.drafts: [gmail.drafts.create]
+      gmail.readonly: [gmail.metadata]
+      calendar: [calendar.readonly]
+      # Docs, Sheets, and Slides accept the drive scope too.
+      drive: [drive.readonly, drive.metadata, drive.metadata.readonly, documents, spreadsheets, presentations]
+      drive.readonly: [drive.metadata.readonly]
+      drive.metadata: [drive.metadata.readonly]
+    clientHelp: "Create a Desktop OAuth client in an Internal Google Cloud app. See the gws filter README."
+  inject:
+    header: authorization
+    format: "Bearer %s"
+  env: [GOOGLE_WORKSPACE_CLI_TOKEN]
+  denyHeaders:
+    - x-goog-api-key
+    # IAM credential headers, an alternative to Authorization.
+    - x-goog-iam-authorization-token
+    - x-goog-iam-authority-selector
+    # Session cookies are a credential too. gws never sends them.
+    - cookie
+    # The header form of fields. A field mask without message IDs would
+    # read a thread without counting its messages. gws never sends it.
+    - x-goog-fieldmask
+    # Upload protocol headers can override uploadType, for example turn a
+    # checked multipart body into a raw message whose preamble carries other
+    # recipients. gws never sends them.
+    - x-goog-upload-protocol
+    - x-goog-upload-command
+    - x-goog-upload-content-type
+    - x-goog-upload-content-length
+    - x-goog-upload-offset
+    - x-goog-upload-header-content-type
+    - x-goog-upload-header-content-length
+    - x-upload-content-type
+    - x-upload-content-length
+  # Enclave denies parameter names with other characters than letters, digits,
+  # and ._~-, so the system parameters $alt, $ct, $fields, and $key, which
+  # override what the gateway checks, need no entry.
+  denyParams:
+    - access_token
+    - oauth_token
+    - key
+    - api_key
+    # Resumable upload sessions authenticate by upload_id alone, so a session
+    # created elsewhere would be a channel out. upload_protocol is the newer
+    # name of uploadType. gws uses neither.
+    - upload_id
+    - upload_protocol
+
+resolvers:
+  driveParents:
+    url: "https://www.googleapis.com/drive/v3/files/{id}?fields=parents&supportsAllDrives=true"
+    extract: "$.parents[*]"
+    recursive: true
+    maxDepth: 32
+    scopes: [drive.metadata.readonly]
+
+counters:
+  mail.metadata:
+    description: Messages whose headers or snippet were read
+    unit: messages
+  mail.read:
+    description: Messages whose content was read
+    unit: messages
+  mail.sent:
+    description: Messages sent
+    unit: messages
+  mail.recipients:
+    description: Distinct recipients and reply addresses of sent messages
+    unit: addresses
+  mail.drafts:
+    description: Drafts created
+    unit: drafts
+  files.read:
+    description: Files whose content was read
+    unit: files
+  files.written:
+    description: Write requests to Drive, Docs, Sheets, and Slides. One request can rewrite a whole file
+    unit: requests
+
+capabilities:
+  discovery:
+    description: API discovery documents, fetched without a credential
+    public: true
+  mail.metadata:
+    description: List messages and threads, read headers, snippets, labels, and history
+    scopes: [gmail.metadata]
+  mail.read:
+    description: Read and search messages, attachments, drafts, and send-as addresses
+    scopes: [gmail.readonly]
+  mail.draft:
+    description: Create drafts. Never sends.
+    scopes: [gmail.drafts.create]
+  mail.send:
+    description: Send new messages to allowed recipients and reply addresses
+    scopes: [gmail.send]
+    constraints:
+      recipients: { kind: email, var: recipients }
+  profile:
+    description: Read your display name for the From header
+    scopes: [userinfo.profile]
+  calendar.read:
+    description: Read calendars, events, settings, and free/busy information
+    scopes: [calendar.readonly]
+  drive.metadata:
+    description: List Drive files, search them by name and metadata, and read their metadata
+    scopes: [drive.metadata.readonly]
+  files.read:
+    description: Read and search the content of Drive files, Docs, Sheets, and Slides
+    scopes: [drive.readonly]
+    constraints:
+      resources: { kind: resource, var: fileId, resolver: driveParents, default: "*" }
+  # Neither drive.metadata nor the Docs, Sheets, and Slides scopes can share,
+  # permanently delete, or upload Drive files, so a route gap here cannot
+  # either.
+  files.edit:
+    description: Edit existing Docs, Sheets, and Slides and the metadata of Drive files, without pulling in other files or URLs
+    scopes: [drive.metadata, documents, spreadsheets, presentations]
+    constraints:
+      resources: { kind: resource, var: fileId, resolver: driveParents }
+  # Drive converts content uploaded to a Doc, Sheet, or Slides file, and the
+  # filter cannot see the target's type. Converted content skips the edit
+  # checks, so formulas, images, and links in it fetch URLs or read other
+  # files.
+  files.replace:
+    description: Replace the content of existing files by upload. Converted Docs, Sheets, and Slides content skips the edit checks
+    scopes: [drive]
+    constraints:
+      resources: { kind: resource, var: fileId, resolver: driveParents }
+  files.import:
+    description: Upload files that Drive converts to Docs, Sheets, or Slides. Converted content skips the edit checks
+    scopes: [drive]
+    constraints:
+      parents: { kind: resource, var: parents, resolver: driveParents }
+  files.create:
+    description: Create files and folders, and upload files without conversion
+    scopes: [drive]
+    constraints:
+      parents: { kind: resource, var: parents, resolver: driveParents }
+  files.move:
+    description: Move files between folders
+    scopes: [drive]
+    constraints:
+      resources: { kind: resource, var: fileId, resolver: driveParents }
+      parents: { kind: resource, var: parents, resolver: driveParents }
+  files.delete:
+    description: Move files to the trash. Never deletes permanently.
+    scopes: [drive]
+    constraints:
+      resources: { kind: resource, var: fileId, resolver: driveParents }
+
+routes:
+  # Discovery
+  # gws fetches www.googleapis.com/discovery/v1/apis/<api>/<version>/rest and
+  # falls back to <api>.googleapis.com/$discovery/rest?version=<version>.
+  - op: discovery.apis.getRest
+    capability: discovery
+    method: GET
+    host: www.googleapis.com
+    path: /discovery/v1/apis/{api}/{version}/rest
+  - op: discovery.rest
+    capability: discovery
+    method: GET
+    host: [gmail.googleapis.com, docs.googleapis.com, sheets.googleapis.com, slides.googleapis.com, people.googleapis.com]
+    path: "/$discovery/rest"
+
+  # Batch requests carry inner requests the filter cannot inspect.
+  - op: batch
+    action: deny
+    reason: batch requests are not inspected, send each request on its own
+    method: [GET, POST, PUT, PATCH, DELETE]
+    host: [www.googleapis.com, gmail.googleapis.com, docs.googleapis.com, sheets.googleapis.com, slides.googleapis.com, people.googleapis.com]
+    path: /batch/**
+  - op: batch.root
+    action: deny
+    reason: batch requests are not inspected, send each request on its own
+    method: [GET, POST, PUT, PATCH, DELETE]
+    host: [www.googleapis.com, gmail.googleapis.com, docs.googleapis.com, sheets.googleapis.com, slides.googleapis.com, people.googleapis.com]
+    path: /batch
+
+  # Gmail
+  # Only the authenticated user's mailbox (users/me), never another userId.
+  - op: gmail.users.getProfile
+    capability: mail.metadata
+    method: GET
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/profile
+  - op: gmail.users.labels.list
+    capability: mail.metadata
+    method: GET
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/labels
+  - op: gmail.users.labels.get
+    capability: mail.metadata
+    method: GET
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/labels/{id}
+  - op: gmail.users.history.list
+    capability: mail.metadata
+    method: GET
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/history
+
+  # A search query matches message bodies, so its results reveal content. Lists
+  # with q need mail.read. Each -search route catches what the route before it
+  # leaves, which is every request with q. Google rejects q under
+  # gmail.metadata anyway. gws +triage always sends q.
+  - op: gmail.users.messages.list
+    capability: mail.metadata
+    method: GET
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/messages
+    query: { q: [~] }
+  - op: gmail.users.messages.list-search
+    capability: mail.read
+    method: GET
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/messages
+  # Thread lists carry a snippet of each thread, so they count the thread IDs,
+  # which are the IDs of their first messages. A field mask could leave out
+  # the IDs, so fields must be absent.
+  - op: gmail.users.threads.list
+    capability: mail.metadata
+    method: GET
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/threads
+    query: { q: [~], alt: [json, ~], fields: [~] }
+    bind:
+      threadIds: [{ response: {} }, { json: "$.threads[*].id" }]
+    count:
+      - { counter: mail.metadata, key: threadIds }
+  - op: gmail.users.threads.list-search
+    capability: mail.read
+    method: GET
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/threads
+    query: { alt: [json, ~], fields: [~] }
+    bind:
+      threadIds: [{ response: {} }, { json: "$.threads[*].id" }]
+    count:
+      - { counter: mail.metadata, key: threadIds }
+  - op: gmail.users.drafts.list
+    capability: mail.metadata
+    method: GET
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/drafts
+    query: { q: [~] }
+  - op: gmail.users.drafts.list-search
+    capability: mail.read
+    method: GET
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/drafts
+
+  # Without format, Gmail returns the full message. Unknown format values
+  # match no route. The metadata and minimal formats include a snippet of the
+  # body, so they count against mail.metadata.
+  - op: gmail.users.messages.get-metadata
+    capability: mail.metadata
+    method: GET
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/messages/{id}
+    query: { format: [metadata, minimal], alt: [json, ~] }
+    count:
+      - { counter: mail.metadata, key: id }
+  - op: gmail.users.messages.get
+    capability: mail.read
+    method: GET
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/messages/{id}
+    query: { format: [full, raw, ~] }
+    count:
+      - { counter: mail.read, key: id }
+  # An attachment is content of its message, so it counts that message.
+  - op: gmail.users.messages.attachments.get
+    capability: mail.read
+    method: GET
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/messages/{messageId}/attachments/{id}
+    count:
+      - { counter: mail.read, key: messageId }
+  # The thread's message IDs are only known from the response. alt keeps the
+  # response JSON so the bind can parse it. A field mask could leave out the
+  # IDs, so fields must be absent.
+  - op: gmail.users.threads.get-metadata
+    capability: mail.metadata
+    method: GET
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/threads/{id}
+    query: { format: [metadata, minimal], alt: [json, ~], fields: [~] }
+    bind:
+      messageIds: [{ response: {} }, { json: "$.messages[*].id" }]
+    count:
+      - { counter: mail.metadata, key: messageIds }
+  - op: gmail.users.threads.get
+    capability: mail.read
+    method: GET
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/threads/{id}
+    query: { format: [full, ~], alt: [json, ~], fields: [~] }
+    bind:
+      messageIds: [{ response: {} }, { json: "$.messages[*].id" }]
+    count:
+      - { counter: mail.read, key: messageIds }
+  - op: gmail.users.drafts.get-metadata
+    capability: mail.metadata
+    method: GET
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/drafts/{id}
+    query: { format: [metadata, minimal], alt: [json, ~], fields: [~] }
+    bind:
+      messageIds: [{ response: {} }, { json: "$.message.id" }]
+    count:
+      - { counter: mail.metadata, key: messageIds }
+  - op: gmail.users.drafts.get
+    capability: mail.read
+    method: GET
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/drafts/{id}
+    query: { format: [full, raw, ~], alt: [json, ~], fields: [~] }
+    bind:
+      messageIds: [{ response: {} }, { json: "$.message.id" }]
+    count:
+      - { counter: mail.read, key: messageIds }
+  # gws +send, +reply, and +forward read the send-as addresses for the From
+  # header. The response includes signatures, so it needs mail.read.
+  - op: gmail.users.settings.sendAs.list
+    capability: mail.read
+    method: GET
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/settings/sendAs
+  - op: gmail.users.settings.change
+    action: deny
+    reason: mail settings can forward mail, add filters, send-as addresses, or delegates
+    method: [POST, PUT, PATCH, DELETE]
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/settings/**
+  - op: gmail.users.watch
+    action: deny
+    reason: push notifications go to a topic the caller picks
+    method: POST
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/watch
+
+  # Drafts are created only. drafts.send would send a draft whose recipients
+  # live on the server, so they cannot be checked, and it needs a broader
+  # scope than gmail.send. Updating and deleting drafts have no route.
+  - op: gmail.users.drafts.send
+    action: deny
+    reason: the recipients of a stored draft cannot be checked, use messages.send
+    method: POST
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/drafts/send
+  - op: gmail.users.drafts.send-upload
+    action: deny
+    reason: the recipients of a stored draft cannot be checked, use messages.send
+    method: POST
+    host: gmail.googleapis.com
+    path: /upload/gmail/v1/users/me/drafts/send
+  - op: gmail.users.drafts.create
+    capability: mail.draft
+    method: POST
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/drafts
+    query: { uploadType: [~] }
+    count:
+      - { counter: mail.drafts }
+  # gws sends drafts and mail as multipart/related: JSON metadata, then the
+  # RFC 822 message.
+  - op: gmail.users.drafts.create-upload
+    capability: mail.draft
+    method: POST
+    host: gmail.googleapis.com
+    path: /upload/gmail/v1/users/me/drafts
+    query: { uploadType: [multipart] }
+    multipartParts: 2
+    count:
+      - { counter: mail.drafts }
+
+  # Inserted or imported mail looks received.
+  - op: gmail.users.messages.insert
+    action: deny
+    reason: inserted mail looks received
+    method: POST
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/messages
+  - op: gmail.users.messages.insert-upload
+    action: deny
+    reason: inserted mail looks received
+    method: POST
+    host: gmail.googleapis.com
+    path: /upload/gmail/v1/users/me/messages
+  - op: gmail.users.messages.import
+    action: deny
+    reason: imported mail looks received
+    method: POST
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/messages/import
+  - op: gmail.users.messages.import-upload
+    action: deny
+    reason: imported mail looks received
+    method: POST
+    host: gmail.googleapis.com
+    path: /upload/gmail/v1/users/me/messages/import
+
+  # Recipients come from the To, Cc, Bcc, and Resent-* headers of the raw
+  # message, and from the headers that direct replies, receipts, and bounces,
+  # such as Reply-To. All of them must pass the constraint. gws never sends
+  # payload, so only raw and threadId are allowed.
+  - op: gmail.users.messages.send
+    capability: mail.send
+    method: POST
+    host: gmail.googleapis.com
+    path: /gmail/v1/users/me/messages/send
+    query: { uploadType: [~] }
+    jsonAllowedKeys: { "$": [raw, threadId] }
+    bind:
+      recipients: [{ body: {} }, { json: "$.raw" }, { base64url: {} }, { rfc822: destinations }]
+    count:
+      - { counter: mail.sent }
+      - { counter: mail.recipients, key: recipients }
+  # Exactly two parts, as gws sends them. Google reads the first as metadata
+  # and the second as the message, so the bind takes the second part. The
+  # metadata must not carry a raw message or payload of its own. gws sends {}
+  # or a threadId.
+  - op: gmail.users.messages.send-upload
+    capability: mail.send
+    method: POST
+    host: gmail.googleapis.com
+    path: /upload/gmail/v1/users/me/messages/send
+    query: { uploadType: [multipart] }
+    multipartParts: 2
+    jsonAllowedKeys: { "$": [threadId] }
+    bind:
+      recipients: [{ body: {} }, { multipart: { index: 1 } }, { rfc822: destinations }]
+    maxBodyBytes: 41943040 # 40 MiB, Gmail's 35 MiB message limit plus framing
+    count:
+      - { counter: mail.sent }
+      - { counter: mail.recipients, key: recipients }
+
+  # People
+  - op: people.people.get
+    capability: profile
+    method: GET
+    host: people.googleapis.com
+    path: /v1/people/me
+    query: { personFields: [names], requestMask.includeField: [~] }
+
+  # Calendar
+  # Read only. Calendar IDs look like addresses (user@example.com,
+  # ...@group.calendar.google.com) and may contain "#", hence the wider
+  # capture.
+  - op: calendar.calendarList.list
+    capability: calendar.read
+    method: GET
+    host: www.googleapis.com
+    path: /calendar/v3/users/me/calendarList
+  - op: calendar.calendarList.get
+    capability: calendar.read
+    method: GET
+    host: www.googleapis.com
+    path: "/calendar/v3/users/me/calendarList/{calendarId:.+}"
+  - op: calendar.settings.list
+    capability: calendar.read
+    method: GET
+    host: www.googleapis.com
+    path: /calendar/v3/users/me/settings
+  - op: calendar.settings.get
+    capability: calendar.read
+    method: GET
+    host: www.googleapis.com
+    path: /calendar/v3/users/me/settings/{setting}
+  - op: calendar.colors.get
+    capability: calendar.read
+    method: GET
+    host: www.googleapis.com
+    path: /calendar/v3/colors
+  - op: calendar.calendars.get
+    capability: calendar.read
+    method: GET
+    host: www.googleapis.com
+    path: "/calendar/v3/calendars/{calendarId:.+}"
+  - op: calendar.events.list
+    capability: calendar.read
+    method: GET
+    host: www.googleapis.com
+    path: "/calendar/v3/calendars/{calendarId:.+}/events"
+  - op: calendar.events.get
+    capability: calendar.read
+    method: GET
+    host: www.googleapis.com
+    path: "/calendar/v3/calendars/{calendarId:.+}/events/{eventId}"
+  - op: calendar.events.instances
+    capability: calendar.read
+    method: GET
+    host: www.googleapis.com
+    path: "/calendar/v3/calendars/{calendarId:.+}/events/{eventId}/instances"
+  # A POST, but it only reads busy times.
+  - op: calendar.freebusy.query
+    capability: calendar.read
+    method: POST
+    host: www.googleapis.com
+    path: /calendar/v3/freeBusy
+  - op: calendar.acl.insert
+    action: deny
+    reason: sharing a calendar grants lasting access outside the session
+    method: POST
+    host: www.googleapis.com
+    path: "/calendar/v3/calendars/{calendarId:.+}/acl"
+  - op: calendar.acl.change
+    action: deny
+    reason: sharing a calendar grants lasting access outside the session
+    method: [PUT, PATCH, DELETE]
+    host: www.googleapis.com
+    path: "/calendar/v3/calendars/{calendarId:.+}/acl/{ruleId}"
+
+  # Drive
+  # Not routed: access proposals, approvals, comments, revisions, changes,
+  # watch, download operations, labels, shared drive changes, and resumable
+  # uploads.
+  - op: drive.about.get
+    capability: drive.metadata
+    method: GET
+    host: www.googleapis.com
+    path: /drive/v3/about
+  - op: drive.drives.list
+    capability: drive.metadata
+    method: GET
+    host: www.googleapis.com
+    path: /drive/v3/drives
+  - op: drive.drives.get
+    capability: drive.metadata
+    method: GET
+    host: www.googleapis.com
+    path: /drive/v3/drives/{driveId}
+  # A fullText search matches file content, so its results reveal content of
+  # files outside a files.read list. It needs files.read with resources "*".
+  # Searches by name and other metadata stay under drive.metadata.
+  - op: drive.files.list-fullText
+    capability: files.read
+    wildcardOnly: [resources]
+    method: GET
+    host: www.googleapis.com
+    path: /drive/v3/files
+    queryMatch: { q: '(?i)full[\s\p{Z}\p{Cf}]*text' }
+  - op: drive.files.list
+    capability: drive.metadata
+    method: GET
+    host: www.googleapis.com
+    path: /drive/v3/files
+  # These literal paths also match files/{fileId} below, so they come first.
+  # generateIds needs a scope that can create files.
+  - op: drive.files.generateIds
+    capability: files.create
+    wildcardOnly: [parents]
+    method: GET
+    host: www.googleapis.com
+    path: /drive/v3/files/generateIds
+  - op: drive.files.generateCseToken
+    action: deny
+    reason: client-side encryption is not supported
+    method: GET
+    host: www.googleapis.com
+    path: /drive/v3/files/generateCseToken
+  - op: drive.files.emptyTrash
+    action: deny
+    reason: permanent deletion cannot be undone
+    method: DELETE
+    host: www.googleapis.com
+    path: /drive/v3/files/trash
+  - op: drive.files.delete
+    action: deny
+    reason: permanent deletion cannot be undone, set trashed to true instead
+    method: DELETE
+    host: www.googleapis.com
+    path: /drive/v3/files/{fileId}
+  - op: drive.permissions.create
+    action: deny
+    reason: sharing grants lasting access outside the session
+    method: POST
+    host: www.googleapis.com
+    path: /drive/v3/files/{fileId}/permissions
+  - op: drive.permissions.change
+    action: deny
+    reason: sharing grants lasting access outside the session
+    method: [PATCH, DELETE]
+    host: www.googleapis.com
+    path: /drive/v3/files/{fileId}/permissions/{permissionId}
+  - op: drive.files.copy
+    action: deny
+    reason: a copy reads one file and writes another, past the files.read checks
+    method: POST
+    host: www.googleapis.com
+    path: /drive/v3/files/{fileId}/copy
+  # alt=media returns the content. Any other alt than json or media matches
+  # nothing.
+  - op: drive.files.get
+    capability: drive.metadata
+    method: GET
+    host: www.googleapis.com
+    path: /drive/v3/files/{fileId}
+    query: { alt: [json, ~] }
+  - op: drive.files.get-media
+    capability: files.read
+    method: GET
+    host: www.googleapis.com
+    path: /drive/v3/files/{fileId}
+    query: { alt: [media] }
+    count:
+      - { counter: files.read, key: fileId }
+  - op: drive.files.export
+    capability: files.read
+    method: GET
+    host: www.googleapis.com
+    path: /drive/v3/files/{fileId}/export
+    count:
+      - { counter: files.read, key: fileId }
+
+  # files.update without a body, or with a JSON body. Parents change only
+  # through addParents and removeParents, which make it a move. trashed: true
+  # makes it a delete. The allowed fields leave out every field that widens
+  # who can share, see, copy, or download the file, such as writersCanShare
+  # and downloadRestrictions, and parents, mimeType, shortcutDetails, and
+  # contentRestrictions. copyRequiresWriterPermission and its deprecated
+  # inverse viewersCanCopyContent may only restrict.
+  - op: drive.files.update
+    capability: files.edit
+    method: PATCH
+    host: www.googleapis.com
+    path: /drive/v3/files/{fileId}
+    query: { uploadType: [~], addParents: [~], removeParents: [~] }
+    jsonAllowedKeys: &fileUpdateKeys
+      "$":
+        - name
+        - description
+        - starred
+        - trashed
+        - properties
+        - appProperties
+        - folderColorRgb
+        - contentHints
+        - originalFilename
+        - modifiedTime
+        - viewedByMeTime
+        - copyRequiresWriterPermission
+        - viewersCanCopyContent
+    json:
+      "$.trashed": [false, ~]
+      "$.copyRequiresWriterPermission": [true, ~]
+      "$.viewersCanCopyContent": [false, ~]
+    count:
+      - { counter: files.written }
+  - op: drive.files.update-trash
+    capability: files.delete
+    method: PATCH
+    host: www.googleapis.com
+    path: /drive/v3/files/{fileId}
+    query: { uploadType: [~], addParents: [~], removeParents: [~] }
+    jsonAllowedKeys: *fileUpdateKeys
+    json:
+      "$.trashed": [true]
+      "$.copyRequiresWriterPermission": [true, ~]
+      "$.viewersCanCopyContent": [false, ~]
+    count:
+      - { counter: files.written }
+  # Catches updates with addParents or removeParents. The destinations must
+  # pass the parents constraint. removeParents alone binds no parents, so it
+  # passes only with parents "*".
+  - op: drive.files.update-move
+    capability: files.move
+    method: PATCH
+    host: www.googleapis.com
+    path: /drive/v3/files/{fileId}
+    query: { uploadType: [~] }
+    jsonAllowedKeys: *fileUpdateKeys
+    json:
+      "$.trashed": [false, ~]
+      "$.copyRequiresWriterPermission": [true, ~]
+      "$.viewersCanCopyContent": [false, ~]
+    bind:
+      parents: [{ query: addParents }, { split: "," }]
+    count:
+      - { counter: files.written }
+  # Every other files.update, so the denial says why.
+  - op: drive.files.update-unsupported
+    action: deny
+    reason: >-
+      the update sets a field the filter does not allow, widens sharing,
+      trashes while moving, or uses an unsupported parameter. Change parents
+      with addParents and removeParents
+    method: PATCH
+    host: www.googleapis.com
+    path: /drive/v3/files/{fileId}
+  # Content replacement. multipart carries JSON metadata first, media carries
+  # only content. Drive converts the content when the file is a Doc, Sheet,
+  # or Slides file. A mimeType in the metadata would convert other files too,
+  # so the allowed fields leave it out.
+  - op: drive.files.update-upload
+    capability: files.replace
+    method: PATCH
+    host: www.googleapis.com
+    path: /upload/drive/v3/files/{fileId}
+    query: { uploadType: [multipart], addParents: [~], removeParents: [~] }
+    multipartParts: 2
+    jsonAllowedKeys: *fileUpdateKeys
+    json:
+      "$.trashed": [false, ~]
+      "$.copyRequiresWriterPermission": [true, ~]
+      "$.viewersCanCopyContent": [false, ~]
+    maxBodyBytes: 67108864 # 64 MiB
+    count:
+      - { counter: files.written }
+  - op: drive.files.update-media
+    capability: files.replace
+    method: PATCH
+    host: www.googleapis.com
+    path: /upload/drive/v3/files/{fileId}
+    query: { uploadType: [media], addParents: [~], removeParents: [~] }
+    count:
+      - { counter: files.written }
+
+  # Without parents, Drive creates in My Drive. That binds no parents and
+  # passes only with parents "*". The mimeType list keeps out shortcuts, Apps
+  # Script projects, and forms. The allowed fields leave out the sharing
+  # fields, shortcutDetails, and contentRestrictions.
+  - op: drive.files.create
+    capability: files.create
+    method: POST
+    host: www.googleapis.com
+    path: /drive/v3/files
+    query: { uploadType: [~] }
+    jsonAllowedKeys: &fileCreateKeys
+      "$":
+        - id
+        - name
+        - mimeType
+        - parents
+        - description
+        - starred
+        - properties
+        - appProperties
+        - folderColorRgb
+        - contentHints
+        - originalFilename
+        - createdTime
+        - modifiedTime
+        - viewedByMeTime
+    json:
+      "$.mimeType":
+        - ~
+        - application/vnd.google-apps.folder
+        - application/vnd.google-apps.document
+        - application/vnd.google-apps.spreadsheet
+        - application/vnd.google-apps.presentation
+    bind:
+      parents: [{ body: {} }, { json: "$.parents[*]" }]
+    count:
+      - { counter: files.written }
+  # gws +upload. Without a mimeType in the metadata, Drive takes the media
+  # part's type and converts nothing.
+  - op: drive.files.create-upload
+    capability: files.create
+    method: POST
+    host: www.googleapis.com
+    path: /upload/drive/v3/files
+    query: { uploadType: [multipart] }
+    multipartParts: 2
+    jsonAllowedKeys: *fileCreateKeys
+    json: { "$.mimeType": [~] }
+    bind:
+      parents: [{ body: {} }, { multipart: "application/json" }, { json: "$.parents[*]" }]
+    maxBodyBytes: 67108864 # 64 MiB
+    count:
+      - { counter: files.written }
+  # A Docs, Sheets, or Slides mimeType requests conversion. Other types match
+  # no route.
+  - op: drive.files.create-upload-convert
+    capability: files.import
+    method: POST
+    host: www.googleapis.com
+    path: /upload/drive/v3/files
+    query: { uploadType: [multipart] }
+    multipartParts: 2
+    jsonAllowedKeys: *fileCreateKeys
+    json:
+      "$.mimeType":
+        - application/vnd.google-apps.document
+        - application/vnd.google-apps.spreadsheet
+        - application/vnd.google-apps.presentation
+    bind:
+      parents: [{ body: {} }, { multipart: "application/json" }, { json: "$.parents[*]" }]
+    maxBodyBytes: 67108864 # 64 MiB
+    count:
+      - { counter: files.written }
+
+  # Docs
+  # Docs, Sheets, and Slides IDs are Drive file IDs, so the captures are named
+  # fileId and the Drive resolver applies. create has no parent and lands in
+  # My Drive, so it passes only with parents "*".
+  - op: docs.documents.get
+    capability: files.read
+    method: GET
+    host: docs.googleapis.com
+    path: /v1/documents/{fileId}
+    count:
+      - { counter: files.read, key: fileId }
+  # Google fetches image URIs at insertion, and rich links read the title of
+  # the linked file or page.
+  - op: docs.documents.batchUpdate-fetch
+    action: deny
+    reason: images and rich links make Google fetch a URL or read another file
+    method: POST
+    host: docs.googleapis.com
+    path: "/v1/documents/{fileId}:batchUpdate"
+    jsonPresent: ["$..insertInlineImage", "$..replaceImage", "$..insertRichLink"]
+  - op: docs.documents.batchUpdate-comments
+    action: deny
+    reason: &commentsReason comments mail the people they mention or assign, past the mail.send recipient check
+    method: POST
+    host: docs.googleapis.com
+    path: "/v1/documents/{fileId}:batchUpdate"
+    jsonPresent: ["$..insertComment", "$..addCommentReply", "$..updateCommentPost", "$..deleteComment", "$..deleteCommentReply"]
+  # Whether a mention notifies the person is not verified.
+  - op: docs.documents.batchUpdate-people
+    action: deny
+    reason: &peopleReason person chips and mentions are not supported, write the name or address as text
+    method: POST
+    host: docs.googleapis.com
+    path: "/v1/documents/{fileId}:batchUpdate"
+    jsonPresent: ["$..insertPerson"]
+  # Text, formatting, tables, lists, breaks, headers, footers, footnotes,
+  # tabs, named ranges, dates, and dropdowns. Links in text styles are plain
+  # hyperlinks. Left out besides the kinds denied above: accepting,
+  # rejecting, and deleting suggestions, which other people made.
+  - op: docs.documents.batchUpdate
+    capability: files.edit
+    method: POST
+    host: docs.googleapis.com
+    path: "/v1/documents/{fileId}:batchUpdate"
+    jsonAllowedKeys:
+      "$": [requests, writeControl]
+      "$.requests[*]":
+        - addDocumentTab
+        - createDropdownDefinition
+        - createFooter
+        - createFootnote
+        - createHeader
+        - createNamedRange
+        - createParagraphBullets
+        - deleteContentRange
+        - deleteDropdownDefinition
+        - deleteFooter
+        - deleteHeader
+        - deleteNamedRange
+        - deleteParagraphBullets
+        - deletePositionedObject
+        - deleteTab
+        - deleteTableColumn
+        - deleteTableRow
+        - insertDate
+        - insertDropdown
+        - insertPageBreak
+        - insertSectionBreak
+        - insertTable
+        - insertTableColumn
+        - insertTableRow
+        - insertText
+        - mergeTableCells
+        - pinTableHeaderRows
+        - replaceAllText
+        - replaceNamedRangeContent
+        - unmergeTableCells
+        - updateDocumentStyle
+        - updateDocumentTabProperties
+        - updateDropdownDefinitionProperties
+        - updateDropdownProperties
+        - updateNamedStyle
+        - updateParagraphStyle
+        - updateSectionStyle
+        - updateTableCellStyle
+        - updateTableColumnProperties
+        - updateTableRowStyle
+        - updateTextStyle
+    count:
+      - { counter: files.written }
+  - op: docs.documents.batchUpdate-unsupported
+    action: deny
+    reason: &unsupportedReason the request has a kind or field the filter does not allow
+    method: POST
+    host: docs.googleapis.com
+    path: "/v1/documents/{fileId}:batchUpdate"
+  # Google ignores every field but the title.
+  - op: docs.documents.create
+    capability: files.create
+    wildcardOnly: [parents]
+    method: POST
+    host: docs.googleapis.com
+    path: /v1/documents
+    jsonAllowedKeys: { "$": [title] }
+    count:
+      - { counter: files.written }
+
+  # Sheets
+  # A range such as 'Q1 Plan'!A1:C10 is one path segment, hence the wider
+  # capture. The custom verb after the range is matched first. Writes must not
+  # echo cell values, which could carry content pulled in by formulas.
+  # getByDataFilter and the *ByDataFilter variants have no route.
+  #
+  # IMPORTRANGE reads another spreadsheet, and IMPORTDATA, IMPORTFEED,
+  # IMPORTHTML, IMPORTXML, and IMAGE make Google fetch a URL. The deny routes
+  # check every string that Sheets can read as a formula, whatever the
+  # valueInputOption, and match the function names case-insensitively, also
+  # inside other formulas. Plain values and other formulas pass. The values
+  # route covers update, append, and batchUpdate. Sheets also accepts JSPB,
+  # which Enclave denies on every route that reads the body. Every Sheets
+  # write reaches such a route first.
+  # Google fetches external URLs for IMAGE and the IMPORT functions other
+  # than IMPORTRANGE only once a user allowed it for the spreadsheet. The
+  # setting cannot be turned off again. Keeping it off backs up the formula
+  # checks.
+  - op: sheets.spreadsheets.batchUpdate-externalUrlAccess
+    action: deny
+    reason: &consentReason only a person may allow IMAGE and IMPORT functions to fetch external URLs
+    method: POST
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}:batchUpdate"
+    jsonPresent: ["$..importFunctionsExternalUrlAccessAllowed"]
+  - op: sheets.spreadsheets.create-externalUrlAccess
+    action: deny
+    reason: *consentReason
+    method: POST
+    host: sheets.googleapis.com
+    path: /v4/spreadsheets
+    jsonPresent: ["$..importFunctionsExternalUrlAccessAllowed"]
+  - op: sheets.spreadsheets.values-fetchFormula
+    action: deny
+    reason: &fetchReason IMPORT and IMAGE formulas read other spreadsheets or make Google fetch a URL
+    method: [PUT, POST]
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}/**"
+    jsonMatch: { "$..values[*][*]": &fetchFormula '(?i)(IMPORT[A-Z]*|IMAGE)[\s\p{Z}\p{Cf}]*\(' }
+  # batchUpdate checks cell formulas and cell strings, condition values of
+  # validation, filter, and formatting rules, pivot formulas, gradient points,
+  # and pasted data. A cell string turns into a formula once a user edits the
+  # cell.
+  - op: sheets.spreadsheets.batchUpdate-fetchFormula
+    action: deny
+    reason: *fetchReason
+    method: POST
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}:batchUpdate"
+    jsonMatch: { "$..formulaValue": *fetchFormula }
+  - op: sheets.spreadsheets.batchUpdate-fetchString
+    action: deny
+    reason: *fetchReason
+    method: POST
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}:batchUpdate"
+    jsonMatch: { "$..stringValue": *fetchFormula }
+  - op: sheets.spreadsheets.batchUpdate-fetchCondition
+    action: deny
+    reason: *fetchReason
+    method: POST
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}:batchUpdate"
+    jsonMatch: { "$..userEnteredValue": *fetchFormula }
+  - op: sheets.spreadsheets.batchUpdate-fetchPivotFormula
+    action: deny
+    reason: *fetchReason
+    method: POST
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}:batchUpdate"
+    jsonMatch: { "$..formula": *fetchFormula }
+  - op: sheets.spreadsheets.batchUpdate-fetchGradientPoint
+    action: deny
+    reason: *fetchReason
+    method: POST
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}:batchUpdate"
+    jsonMatch: { "$..value": *fetchFormula }
+  - op: sheets.spreadsheets.batchUpdate-fetchPaste
+    action: deny
+    reason: *fetchReason
+    method: POST
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}:batchUpdate"
+    jsonMatch: { "$..data": *fetchFormula }
+  # Markup can split a function name that Sheets joins again.
+  - op: sheets.spreadsheets.batchUpdate-htmlPaste
+    action: deny
+    reason: HTML pastes can assemble formulas the filter cannot check, paste with a delimiter instead
+    method: POST
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}:batchUpdate"
+    jsonPresent: ["$..pasteData.html"]
+  - op: sheets.spreadsheets.batchUpdate-findReplace
+    action: deny
+    reason: find and replace can turn cells into formulas the filter cannot check
+    method: POST
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}:batchUpdate"
+    jsonPresent: ["$..findReplace"]
+  # Text to columns may parse the split parts as input, including parts of
+  # values that formulas computed.
+  - op: sheets.spreadsheets.batchUpdate-textToColumns
+    action: deny
+    reason: text to columns can turn cells into formulas the filter cannot check
+    method: POST
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}:batchUpdate"
+    jsonPresent: ["$..textToColumns"]
+  - op: sheets.spreadsheets.batchUpdate-externalData
+    action: deny
+    reason: &externalReason data sources such as BigQuery and Looker, and file chips, read data from outside the spreadsheet
+    method: POST
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}:batchUpdate"
+    jsonPresent:
+      - "$..addDataSource"
+      - "$..updateDataSource"
+      - "$..refreshDataSource"
+      - "$..dataSourceId"
+      - "$..dataSourceTable"
+      - "$..dataSourceFormula"
+      - "$..dataSourceChartProperties"
+      - "$..richLinkProperties"
+  - op: sheets.spreadsheets.batchUpdate-comments
+    action: deny
+    reason: *commentsReason
+    method: POST
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}:batchUpdate"
+    jsonPresent: ["$..insertComment", "$..addCommentReply", "$..updateCommentPost", "$..deleteComment", "$..deleteCommentReply"]
+  - op: sheets.spreadsheets.batchUpdate-people
+    action: deny
+    reason: *peopleReason
+    method: POST
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}:batchUpdate"
+    jsonPresent: ["$..personProperties"]
+  # A new spreadsheet can carry cells, rules, and data sources too.
+  - op: sheets.spreadsheets.create-fetchFormula
+    action: deny
+    reason: *fetchReason
+    method: POST
+    host: sheets.googleapis.com
+    path: /v4/spreadsheets
+    jsonMatch: { "$..formulaValue": *fetchFormula }
+  - op: sheets.spreadsheets.create-fetchString
+    action: deny
+    reason: *fetchReason
+    method: POST
+    host: sheets.googleapis.com
+    path: /v4/spreadsheets
+    jsonMatch: { "$..stringValue": *fetchFormula }
+  - op: sheets.spreadsheets.create-fetchCondition
+    action: deny
+    reason: *fetchReason
+    method: POST
+    host: sheets.googleapis.com
+    path: /v4/spreadsheets
+    jsonMatch: { "$..userEnteredValue": *fetchFormula }
+  - op: sheets.spreadsheets.create-fetchPivotFormula
+    action: deny
+    reason: *fetchReason
+    method: POST
+    host: sheets.googleapis.com
+    path: /v4/spreadsheets
+    jsonMatch: { "$..formula": *fetchFormula }
+  - op: sheets.spreadsheets.create-fetchGradientPoint
+    action: deny
+    reason: *fetchReason
+    method: POST
+    host: sheets.googleapis.com
+    path: /v4/spreadsheets
+    jsonMatch: { "$..value": *fetchFormula }
+  - op: sheets.spreadsheets.create-externalData
+    action: deny
+    reason: *externalReason
+    method: POST
+    host: sheets.googleapis.com
+    path: /v4/spreadsheets
+    jsonPresent:
+      - "$..dataSources"
+      - "$..dataSourceId"
+      - "$..dataSourceTable"
+      - "$..dataSourceFormula"
+      - "$..dataSourceChartProperties"
+      - "$..richLinkProperties"
+  - op: sheets.spreadsheets.create-comments
+    action: deny
+    reason: *commentsReason
+    method: POST
+    host: sheets.googleapis.com
+    path: /v4/spreadsheets
+    jsonPresent: ["$..comments"]
+  - op: sheets.spreadsheets.create-people
+    action: deny
+    reason: *peopleReason
+    method: POST
+    host: sheets.googleapis.com
+    path: /v4/spreadsheets
+    jsonPresent: ["$..personProperties"]
+  - op: sheets.spreadsheets.get
+    capability: files.read
+    method: GET
+    host: sheets.googleapis.com
+    path: /v4/spreadsheets/{fileId}
+    count:
+      - { counter: files.read, key: fileId }
+  - op: sheets.spreadsheets.values.get
+    capability: files.read
+    method: GET
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}/values/{range:.+}"
+    count:
+      - { counter: files.read, key: fileId }
+  - op: sheets.spreadsheets.values.batchGet
+    capability: files.read
+    method: GET
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}/values:batchGet"
+    count:
+      - { counter: files.read, key: fileId }
+  - op: sheets.spreadsheets.values.update
+    capability: files.edit
+    method: PUT
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}/values/{range:.+}"
+    query: { includeValuesInResponse: [false, ~] }
+    jsonAllowedKeys: &valueRangeKeys { "$": [range, majorDimension, values] }
+    count:
+      - { counter: files.written }
+  - op: sheets.spreadsheets.values.append
+    capability: files.edit
+    method: POST
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}/values/{range:.+}:append"
+    query: { includeValuesInResponse: [false, ~] }
+    jsonAllowedKeys: *valueRangeKeys
+    count:
+      - { counter: files.written }
+  - op: sheets.spreadsheets.values.clear
+    capability: files.edit
+    method: POST
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}/values/{range:.+}:clear"
+    jsonAllowedKeys: { "$": [] }
+    count:
+      - { counter: files.written }
+  - op: sheets.spreadsheets.values.batchUpdate
+    capability: files.edit
+    method: POST
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}/values:batchUpdate"
+    jsonAllowedKeys:
+      "$": [valueInputOption, data, includeValuesInResponse, responseValueRenderOption, responseDateTimeRenderOption]
+      "$.data[*]": [range, majorDimension, values]
+    json: { "$.includeValuesInResponse": [false, ~] }
+    count:
+      - { counter: files.written }
+  - op: sheets.spreadsheets.values.batchClear
+    capability: files.edit
+    method: POST
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}/values:batchClear"
+    jsonAllowedKeys: { "$": [ranges] }
+    count:
+      - { counter: files.written }
+  # Every request kind except the ones denied above and the data source
+  # requests, which only act on data sources.
+  - op: sheets.spreadsheets.batchUpdate
+    capability: files.edit
+    method: POST
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}:batchUpdate"
+    jsonAllowedKeys:
+      "$": [requests, includeSpreadsheetInResponse, responseIncludeGridData, responseRanges]
+      "$.requests[*]":
+        - addBanding
+        - addChart
+        - addConditionalFormatRule
+        - addDimensionGroup
+        - addFilterView
+        - addNamedRange
+        - addProtectedRange
+        - addSheet
+        - addSlicer
+        - addTable
+        - appendCells
+        - appendDimension
+        - autoFill
+        - autoResizeDimensions
+        - clearBasicFilter
+        - copyPaste
+        - createDeveloperMetadata
+        - cutPaste
+        - deleteBanding
+        - deleteConditionalFormatRule
+        - deleteDeveloperMetadata
+        - deleteDimension
+        - deleteDimensionGroup
+        - deleteDuplicates
+        - deleteEmbeddedObject
+        - deleteFilterView
+        - deleteNamedRange
+        - deleteProtectedRange
+        - deleteRange
+        - deleteSheet
+        - deleteTable
+        - duplicateFilterView
+        - duplicateSheet
+        - insertDimension
+        - insertRange
+        - mergeCells
+        - moveDimension
+        - pasteData
+        - randomizeRange
+        - repeatCell
+        - setBasicFilter
+        - setDataValidation
+        - sortRange
+        - trimWhitespace
+        - unmergeCells
+        - updateBanding
+        - updateBorders
+        - updateCells
+        - updateChartSpec
+        - updateConditionalFormatRule
+        - updateDeveloperMetadata
+        - updateDimensionGroup
+        - updateDimensionProperties
+        - updateEmbeddedObjectBorder
+        - updateEmbeddedObjectPosition
+        - updateFilterView
+        - updateNamedRange
+        - updateProtectedRange
+        - updateSheetProperties
+        - updateSlicerSpec
+        - updateSpreadsheetProperties
+        - updateTable
+    json:
+      "$.includeSpreadsheetInResponse": [false, ~]
+      "$.responseIncludeGridData": [false, ~]
+    count:
+      - { counter: files.written }
+  - op: sheets.spreadsheets.batchUpdate-unsupported
+    action: deny
+    reason: *unsupportedReason
+    method: POST
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}:batchUpdate"
+  # Sheet fields other than commentAnchors.
+  - op: sheets.spreadsheets.create
+    capability: files.create
+    wildcardOnly: [parents]
+    method: POST
+    host: sheets.googleapis.com
+    path: /v4/spreadsheets
+    jsonAllowedKeys:
+      "$": [properties, sheets, namedRanges, developerMetadata]
+      "$.sheets[*]":
+        - properties
+        - data
+        - merges
+        - conditionalFormats
+        - filterViews
+        - protectedRanges
+        - basicFilter
+        - charts
+        - bandedRanges
+        - developerMetadata
+        - rowGroups
+        - columnGroups
+        - slicers
+        - tables
+    count:
+      - { counter: files.written }
+  - op: sheets.spreadsheets.sheets.copyTo
+    action: deny
+    reason: a copy reads one file and writes another, past the files.read checks
+    method: POST
+    host: sheets.googleapis.com
+    path: "/v4/spreadsheets/{fileId}/sheets/{sheetId}:copyTo"
+
+  # Slides
+  # Page object IDs may contain colons.
+  - op: slides.presentations.get
+    capability: files.read
+    method: GET
+    host: slides.googleapis.com
+    path: /v1/presentations/{fileId}
+    count:
+      - { counter: files.read, key: fileId }
+  - op: slides.presentations.pages.get
+    capability: files.read
+    method: GET
+    host: slides.googleapis.com
+    path: "/v1/presentations/{fileId}/pages/{pageObjectId:[A-Za-z0-9_:-]+}"
+    count:
+      - { counter: files.read, key: fileId }
+  - op: slides.presentations.pages.getThumbnail
+    capability: files.read
+    method: GET
+    host: slides.googleapis.com
+    path: "/v1/presentations/{fileId}/pages/{pageObjectId:[A-Za-z0-9_:-]+}/thumbnail"
+    count:
+      - { counter: files.read, key: fileId }
+  # Sheets charts copy or link the data of another spreadsheet. Videos embed
+  # a Drive file or a YouTube video. The source has numeric aliases, so every
+  # video is denied.
+  - op: slides.presentations.batchUpdate-crossFile
+    action: deny
+    reason: Sheets charts and videos embed content of another file, past the files.read checks
+    method: POST
+    host: slides.googleapis.com
+    path: "/v1/presentations/{fileId}:batchUpdate"
+    jsonPresent: ["$..createSheetsChart", "$..replaceAllShapesWithSheetsChart", "$..refreshSheetsChart", "$..createVideo"]
+  # Google fetches image URLs, background pictures included, at insertion.
+  - op: slides.presentations.batchUpdate-fetch
+    action: deny
+    reason: images make Google fetch a URL the caller picks
+    method: POST
+    host: slides.googleapis.com
+    path: "/v1/presentations/{fileId}:batchUpdate"
+    jsonPresent: ["$..createImage", "$..replaceAllShapesWithImage", "$..replaceImage", "$..stretchedPictureFill"]
+  - op: slides.presentations.batchUpdate-comments
+    action: deny
+    reason: *commentsReason
+    method: POST
+    host: slides.googleapis.com
+    path: "/v1/presentations/{fileId}:batchUpdate"
+    jsonPresent: ["$..insertComment", "$..addCommentReply", "$..updateCommentPost", "$..deleteComment", "$..deleteCommentReply"]
+  # Every request kind except the ones denied above. Page backgrounds may
+  # only be solid fills. Of the slide properties only isSkipped is writable,
+  # so the notes page, which holds page elements, is left out.
+  - op: slides.presentations.batchUpdate
+    capability: files.edit
+    method: POST
+    host: slides.googleapis.com
+    path: "/v1/presentations/{fileId}:batchUpdate"
+    jsonAllowedKeys:
+      "$": [requests, writeControl]
+      "$.requests[*]":
+        - createLine
+        - createParagraphBullets
+        - createShape
+        - createSlide
+        - createTable
+        - deleteObject
+        - deleteParagraphBullets
+        - deleteTableColumn
+        - deleteTableRow
+        - deleteText
+        - duplicateObject
+        - groupObjects
+        - insertTableColumns
+        - insertTableRows
+        - insertText
+        - mergeTableCells
+        - replaceAllText
+        - rerouteLine
+        - ungroupObjects
+        - unmergeTableCells
+        - updateImageProperties
+        - updateLineCategory
+        - updateLineProperties
+        - updatePageElementAltText
+        - updatePageElementTransform
+        - updatePageElementsZOrder
+        - updatePageProperties
+        - updateParagraphStyle
+        - updateShapeProperties
+        - updateSlideProperties
+        - updateSlidesPosition
+        - updateTableBorderProperties
+        - updateTableCellProperties
+        - updateTableColumnProperties
+        - updateTableRowProperties
+        - updateTextStyle
+        - updateVideoProperties
+      "$.requests[*].updatePageProperties.pageProperties.pageBackgroundFill": [propertyState, solidFill]
+      "$.requests[*].updateSlideProperties.slideProperties": [isSkipped]
+    count:
+      - { counter: files.written }
+  - op: slides.presentations.batchUpdate-unsupported
+    action: deny
+    reason: *unsupportedReason
+    method: POST
+    host: slides.googleapis.com
+    path: "/v1/presentations/{fileId}:batchUpdate"
+  # Google ignores every field but the title and the presentation ID.
+  - op: slides.presentations.create
+    capability: files.create
+    wildcardOnly: [parents]
+    method: POST
+    host: slides.googleapis.com
+    path: /v1/presentations
+    jsonAllowedKeys: { "$": [presentationId, title] }
+    count:
+      - { counter: files.written }
+
+deny:
+  contentType: "application/json; charset=UTF-8"
+  # Google's error envelope, so gws prints the message and the reason
+  # enclaveFilter. status is PERMISSION_DENIED, RESOURCE_EXHAUSTED for an
+  # exhausted quota, or UNAVAILABLE when the token cannot be refreshed.
+  body: '{"error":{"code":{{code}},"message":{{message}},"status":{{status}},"errors":[{"reason":"enclaveFilter","message":{{message}}}]}}'

@@ -1,0 +1,14 @@
+# Copyright (C) 2026 EclipseSource GmbH and others.
+#
+# This program and the accompanying materials are made available under the
+# terms of the MIT License, which is available in the project root.
+#
+# SPDX-License-Identifier: MIT
+
+description: readonly, plus editing every Drive file you can edit and creating files anywhere. No moves, no trash.
+extends: readonly
+allow:
+  files.edit: { resources: "*" }
+  files.create: { parents: "*" }
+quotas:
+  files.written: 500
