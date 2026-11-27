@@ -1,7 +1,8 @@
 # preset
 
-Saved enclave flags per directory or git repository, kept in one file. A
-repository rule covers every worktree of the repository.
+Saved enclave flags per directory, git repository, or globally, kept in one
+file. A repository rule covers every worktree of the repository. A global
+preset works in every directory.
 
 ## Owner
 
@@ -11,7 +12,8 @@ Stefan Dirix ([sdirix@eclipsesource.com](mailto:sdirix@eclipsesource.com))
 
 Keep the enclave flags a repository needs, such as features and allowed
 domains, in one place and start every worktree with them. Named presets cover
-variants such as a read-only review session.
+variants such as a read-only review session, and global presets make one
+available everywhere.
 
 ## State
 
@@ -34,6 +36,7 @@ enclave preset                 # enclave --features +java-dev --allow-domain ...
 enclave preset shell           # saved flags first, then the typed arguments
 enclave preset --tool codex    # a typed --tool overrides a saved one
 enclave preset --show          # matching rules and the resulting command
+enclave preset --use review    # a global preset, from any directory
 ```
 
 `enclave preset [args]` runs `enclave <saved flags> [args]`. Typed arguments
@@ -46,16 +49,19 @@ Without a matching rule it runs `enclave [args]` and says so on stderr.
 
 ## Saving
 
-`--save` checks the given flags with `enclave config`, writes them, and exits.
+`--save` checks the given flags with `enclave config`, asks where to save
+them, writes them, and exits.
 
-| Project directory | `--save` saves for |
-|-------------------|--------------------|
-| Outside git | This path |
-| In a git repository | Asks: this path, or all worktrees of the repository (default) |
+| Choice | Saves for |
+|--------|-----------|
+| This path | The project directory. Default outside git |
+| All worktrees | The repository of the project directory. Offered and default in a git repository |
+| Every directory | A [global preset](#global-presets). Asks for its name unless `--use` gives one |
 
-`--save=path` and `--save=repo` skip the question. Before writing, `--save`
-shows the flags it would replace and the rules that keep precedence here, and
-asks to confirm. Without a terminal it fails instead.
+`--save=path`, `--save=repo`, and `--save=global` skip the question. Before
+writing, `--save` shows the flags it would replace and the rules that keep
+precedence here, and asks to confirm. Without a terminal it fails instead of
+asking.
 
 Commands, `--` with tool arguments, `enclave config`'s own `--view` and
 `--json`, and enclave's
@@ -81,6 +87,20 @@ enclave preset --use ui
 
 Presets are independent: `ui` does not include the flags of `default`.
 
+### Global presets
+
+A global preset is not tied to a directory. Invoke it from anywhere with
+`--use`:
+
+```bash
+enclave preset --save=global --use review --project-mount readonly
+enclave preset --use review
+```
+
+A path, repository, or pattern rule that defines the same name takes
+precedence. A global `default` applies wherever no rule defines `default`, so
+saving globally without `--use` asks for a name instead of using `default`.
+
 ## Rules file
 
 `--save` writes `presets.json` in enclave's config directory
@@ -88,6 +108,9 @@ Presets are independent: `ui` does not include the flags of `default`.
 
 ```json
 {
+  "presets": {
+    "review": ["--project-mount", "readonly"]
+  },
   "rules": [
     {
       "repo": "~/Git/enclave/enclave",
@@ -113,6 +136,8 @@ Both take an absolute path or one starting with `~/`. `*`, `?`, or `[...]`
 make it a pattern, unless the path is an existing directory, and `*` also
 matches `/`. Other keys in a rule, such as a `comment`, are ignored.
 
+The top-level `presets` holds the global presets and matches everywhere.
+
 A session can write the project directory, including its `.git`, so a
 repository counts only if its git directory is in the project directory or a
 parent, or if it lists a linked worktree there. Otherwise only `path` rules
@@ -124,6 +149,7 @@ For a preset, the most specific matching rule that defines it wins:
 1. Exact `path`
 2. Exact `repo`
 3. Patterns, in file order
+4. Global presets
 
 A rule without the preset is skipped. A path rule with only `default` still
 lets `--use review` fall through to the repository's rule.

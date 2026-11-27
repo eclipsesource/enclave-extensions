@@ -8,7 +8,8 @@
 
 # `enclave preset`: runs enclave with the flags saved for the current
 # directory in presets.json. A rule matches a directory path or a git
-# repository, so one repository rule covers all of its worktrees.
+# repository, so one repository rule covers all of its worktrees. Global
+# presets apply in every directory.
 #
 # Written for bash 3.2, the /bin/bash of macOS: no mapfile, no associative
 # arrays, and possibly empty arrays expand as ${a[@]+"${a[@]}"} under set -u.
@@ -49,23 +50,25 @@ usage() {
     cat <<EOF
 Usage:
   enclave preset [--use <name>] [enclave args...]
-  enclave preset --save[=path|repo] [--use <name>] <enclave flags...>
+  enclave preset --save[=path|repo|global] [--use <name>] <enclave flags...>
   enclave preset --show [--use <name>] [enclave args...]
 
 Runs enclave with the flags saved for this directory, followed by the given
 arguments. Rules live in $(pretty "$presets_file").
 
   --use <name>      Preset to use or save (default: default)
-  --save            Save the flags for this path, or in a git repository for
-                    this path or all worktrees of the repository, then exit
-  --save=path|repo  Like --save, but skip the path or repository question
+  --save            Ask whether to save the flags for this path, all worktrees
+                    of the repository, or every directory, then exit
+  --save=<scope>    Like --save, but skip the question (path, repo, global)
+                    A global save without --use asks for the preset name
   --show            Print the matching rules and the resulting command
 
 For a preset, the most specific matching rule that defines it wins: exact
-path, then exact repository, then patterns in file order. A * in a pattern
-also matches /.
+path, then exact repository, then patterns in file order, then the global
+presets. A * in a pattern also matches /.
 
-  {"rules": [
+  {"presets": {"review": ["--project-mount", "readonly"]},
+   "rules": [
     {"repo": "~/src/app", "presets": {
       "default": ["--features", "+java-dev"],
       "ui": ["--features", "+java-dev,+vnc"]}},
@@ -140,14 +143,23 @@ check_flags() {
 
 # shellcheck disable=SC2016
 shape_filter='
-type == "object" and ((.rules // []) as $rules
+def flag_sets: type == "object" and all(.[]; type == "array" and all(.[]; type == "string"));
+type == "object"
+and ((.presets // {}) | flag_sets)
+and ((.rules // []) as $rules
 | ($rules | type) == "array"
   and all($rules[];
     type == "object"
     and ([has("path"), has("repo")] | map(select(.)) | length) == 1
     and ((.path // .repo) | type == "string" and . != "")
-    and (.presets | type == "object")
-    and all(.presets[]; type == "array" and all(.[]; type == "string"))))'
+    and (.presets | flag_sets)))'
+
+# The global presets count as one more rule, after those in the file. Rule
+# indexes past .rules address them.
+# shellcheck disable=SC2016
+flag_sets_def='
+def flag_sets($i):
+  if $i < ((.rules // []) | length) then .rules[$i].presets else .presets end;'
 
 rule_kinds=()
 rule_patterns=()
@@ -176,18 +188,26 @@ load_rules() {
         rule_kinds+=("$kind")
         rule_patterns+=("$pattern")
     done < <(jq -r '(.rules // [])[] | if has("path") then "path\t\(.path)" else "repo\t\(.repo)" end' <<<"$rules_json")
+    if jq -e 'has("presets")' <<<"$rules_json" >/dev/null; then
+        rule_kinds+=(global)
+        rule_patterns+=("")
+    fi
 }
 
 rule_desc() {
-    printf '%s %s\n' "${rule_kinds[$1]}" "${rule_patterns[$1]}"
+    if [[ ${rule_kinds[$1]} == global ]]; then
+        echo global
+    else
+        printf '%s %s\n' "${rule_kinds[$1]}" "${rule_patterns[$1]}"
+    fi
 }
 
 has_preset() {
-    jq -e --argjson i "$1" --arg p "$2" '.rules[$i].presets | has($p)' <<<"$rules_json" >/dev/null
+    jq -e --argjson i "$1" --arg p "$2" "$flag_sets_def"' flag_sets($i) | has($p)' <<<"$rules_json" >/dev/null
 }
 
 preset_names() {
-    jq -r --argjson i "$1" '.rules[$i].presets | keys_unsorted | join(", ")' <<<"$rules_json"
+    jq -r --argjson i "$1" "$flag_sets_def"' flag_sets($i) | keys_unsorted | join(", ")' <<<"$rules_json"
 }
 
 preset_args=()
@@ -197,7 +217,7 @@ read_preset() {
     preset_args=()
     while IFS= read -r -d '' a; do
         preset_args+=("$a")
-    done < <(jq -j --argjson i "$1" --arg p "$2" '.rules[$i].presets[$p][] | (., "\u0000")' <<<"$rules_json")
+    done < <(jq -j --argjson i "$1" --arg p "$2" "$flag_sets_def"' flag_sets($i)[$p][] | (., "\u0000")' <<<"$rules_json")
 }
 
 # --- matching -----------------------------------------------------------------
@@ -269,14 +289,17 @@ resolve_repo() {
     repo_dir=${common%/.git}
 }
 
-# Prints 1 (exact path), 2 (exact repository), or 3 (pattern) when rule $1
-# matches this directory, nothing otherwise. A * in a pattern also matches /.
+# Prints 1 (exact path), 2 (exact repository), 3 (pattern), or 4 (global)
+# when rule $1 matches this directory, nothing otherwise. A * in a pattern
+# also matches /.
 rule_tier() {
     local pattern
     pattern=$(expand "${rule_patterns[$1]}")
     # Unquoted right-hand sides are the glob matches.
     # shellcheck disable=SC2053
-    if [[ ${rule_kinds[$1]} == path ]]; then
+    if [[ ${rule_kinds[$1]} == global ]]; then
+        echo 4
+    elif [[ ${rule_kinds[$1]} == path ]]; then
         if is_pattern "$pattern"; then
             [[ $physical_dir == $pattern || $logical_dir == $pattern ]] && echo 3
         else
@@ -304,7 +327,7 @@ match_rules() {
         tiers+=("$(rule_tier "$i")")
         i=$((i + 1))
     done
-    for tier in 1 2 3; do
+    for tier in 1 2 3 4; do
         i=0
         while ((i < n)); do
             if [[ ${tiers[$i]} == "$tier" ]]; then
@@ -335,7 +358,7 @@ run() {
     select_rule "$preset"
     if [[ -z $chosen ]]; then
         if $preset_given; then
-            die "no rule for $(pretty "$physical_dir") defines preset $preset"
+            die "preset $preset is not defined for $(pretty "$physical_dir") or globally"
         fi
         info "no saved flags for $(pretty "$physical_dir")"
         exec "$enclave_bin" ${args[@]+"${args[@]}"}
@@ -366,19 +389,42 @@ show() {
         ${preset_args[@]+"${preset_args[@]}"} ${args[@]+"${args[@]}"})"
 }
 
+# Offers the repository only when there is one, and makes it the default.
 ask_scope() {
-    local reply
+    local reply default=1 scopes=(path)
     if $linked_worktree; then
         info "$(pretty "$physical_dir") is a worktree of $(pretty "$repo_dir")"
     fi
-    printf 'Save preset %s for\n  1) this path: %s\n  2) all worktrees of %s\n' \
-        "$preset" "$(pretty "$physical_dir")" "$(pretty "$repo_dir")" >&2
-    read -r -p 'Choice [2]: ' reply || true
-    case ${reply:-2} in
-        1) scope=path ;;
-        2) scope=repo ;;
-        *) die "invalid choice: $reply" ;;
-    esac
+    printf 'Save preset %s for\n  1) this path: %s\n' "$preset" "$(pretty "$physical_dir")" >&2
+    if [[ -n $repo_dir ]]; then
+        scopes+=(repo)
+        default=2
+        printf '  2) all worktrees of %s\n' "$(pretty "$repo_dir")" >&2
+    fi
+    scopes+=(global)
+    if $preset_given; then
+        printf '  %s) every directory (global)\n' "${#scopes[@]}" >&2
+    else
+        printf '  %s) every directory (named global)\n' "${#scopes[@]}" >&2
+    fi
+    read -r -p "Choice [$default]: " reply || true
+    reply=${reply:-$default}
+    if [[ ! $reply =~ ^[1-9]$ ]] || ((reply > ${#scopes[@]})); then
+        die "invalid choice: $reply"
+    fi
+    scope=${scopes[reply - 1]}
+}
+
+# A global preset without --use would be a global default, which applies to
+# every enclave preset run without a matching rule, so its name is asked.
+ask_global_name() {
+    local reply
+    [[ -t 0 ]] || die "pass --use <name> for a global preset"
+    read -r -p 'Name of the global preset: ' reply || true
+    [[ -n $reply ]] || die "not saved, no name given"
+    [[ $reply =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid preset name: $reply"
+    preset=$reply
+    preset_given=true
 }
 
 tmp_file=""
@@ -424,9 +470,9 @@ write_preset() {
     updated=$(if [[ -n $loaded ]]; then printf '%s\n' "$rules_json"; else printf '{}\n'; fi |
         jq --argjson i "$same" --arg kind "$kind" --arg value "$value" \
             --arg name "$preset" --argjson args "$args_json" '
-            .rules //= []
-            | if $i >= 0 then .rules[$i].presets[$name] = $args
-              else .rules += [{($kind): $value, presets: {($name): $args}}] end') ||
+            if $kind == "global" then .presets[$name] = $args
+            elif $i >= 0 then .rules[$i].presets[$name] = $args
+            else .rules += [{($kind): $value, presets: {($name): $args}}] end') ||
         die "not saved, cannot update $(pretty "$presets_file")"
 
     trap cleanup EXIT
@@ -457,25 +503,38 @@ save() {
         die "not saved, enclave rejected the flags${error:+: $error}"
     fi
 
-    if [[ -z $repo_dir ]]; then
+    if [[ -z $repo_dir && $scope != global ]]; then
         if [[ -n $repo_issue ]]; then
             [[ $scope != repo ]] || die "repository ignored, $repo_issue"
             info "repository ignored, $repo_issue"
         elif [[ $scope == repo ]]; then
             die "$(pretty "$physical_dir") is not in a git repository"
         fi
-        scope=path
-    elif [[ -z $scope ]]; then
-        [[ -t 0 ]] || die "pass --save=path or --save=repo"
+    fi
+    if [[ -z $scope ]]; then
+        if [[ ! -t 0 ]]; then
+            [[ -z $repo_dir ]] || die "pass --save=path, --save=repo, or --save=global"
+            die "pass --save=path or --save=global"
+        fi
         ask_scope
     fi
-    if [[ $scope == path ]]; then
-        target=$physical_dir
-        tier=1
-    else
-        target=$repo_dir
-        tier=2
+    if [[ $scope == global ]] && ! $preset_given; then
+        ask_global_name
     fi
+    case $scope in
+        path)
+            target=$(pretty "$physical_dir")
+            tier=1
+            ;;
+        repo)
+            target=$(pretty "$repo_dir")
+            tier=2
+            ;;
+        global)
+            target=""
+            tier=4
+            ;;
+    esac
 
     # The rule saved for this target is the first exact match of its tier.
     k=0
@@ -507,8 +566,8 @@ save() {
         k=$((k + 1))
     done
 
-    write_preset "$same" "$scope" "$(pretty "$target")" "${args[@]}"
-    info "saved $scope $(pretty "$target") [$preset]: $(quote_args "${args[@]}")"
+    write_preset "$same" "$scope" "$target" "${args[@]}"
+    info "saved $scope${target:+ $target} [$preset]: $(quote_args "${args[@]}")"
 }
 
 # --- main ---------------------------------------------------------------------
@@ -548,11 +607,11 @@ while (($# > 0)); do
             preset_given=true
             ;;
         --save) set_mode save ;;
-        --save=path | --save=repo)
+        --save=path | --save=repo | --save=global)
             set_mode save
             scope=${1#*=}
             ;;
-        --save=*) die "invalid $1 (valid: --save=path, --save=repo)" ;;
+        --save=*) die "invalid $1 (valid: --save=path, --save=repo, --save=global)" ;;
         --show) set_mode show ;;
         *) args+=("$1") ;;
     esac
