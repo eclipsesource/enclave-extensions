@@ -9,4 +9,4 @@ schemaVersion: "1"
 kind: command
 name: preset
 displayName: Flag presets
-description: Saved enclave flags per directory or git repository, from one file
+description: Saved enclave flags per directory, git repository, or globally, from one file
