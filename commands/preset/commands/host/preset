@@ -114,6 +114,10 @@ quote_args() {
     printf '%s\n' "${out# }"
 }
 
+check_name() {
+    [[ $1 =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid preset name: $1"
+}
+
 confirm() {
     local reply
     [[ -t 0 ]] || die "not saved, confirmation needs a terminal"
@@ -145,7 +149,7 @@ check_flags() {
 shape_filter='
 def flag_sets: type == "object" and all(.[]; type == "array" and all(.[]; type == "string"));
 type == "object"
-and ((.presets // {}) | flag_sets)
+and ((has("presets") | not) or (.presets | flag_sets))
 and ((.rules // []) as $rules
 | ($rules | type) == "array"
   and all($rules[];
@@ -187,11 +191,9 @@ load_rules() {
     while IFS=$'\t' read -r kind pattern; do
         rule_kinds+=("$kind")
         rule_patterns+=("$pattern")
-    done < <(jq -r '(.rules // [])[] | if has("path") then "path\t\(.path)" else "repo\t\(.repo)" end' <<<"$rules_json")
-    if jq -e 'has("presets")' <<<"$rules_json" >/dev/null; then
-        rule_kinds+=(global)
-        rule_patterns+=("")
-    fi
+    done < <(jq -r '
+        ((.rules // [])[] | if has("path") then "path\t\(.path)" else "repo\t\(.repo)" end),
+        (if has("presets") then "global\t" else empty end)' <<<"$rules_json")
 }
 
 rule_desc() {
@@ -422,7 +424,7 @@ ask_global_name() {
     [[ -t 0 ]] || die "pass --use <name> for a global preset"
     read -r -p 'Name of the global preset: ' reply || true
     [[ -n $reply ]] || die "not saved, no name given"
-    [[ $reply =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid preset name: $reply"
+    check_name "$reply"
     preset=$reply
     preset_given=true
 }
@@ -618,7 +620,7 @@ while (($# > 0)); do
     shift
 done
 
-[[ $preset =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid preset name: $preset"
+check_name "$preset"
 
 load_rules
 resolve_repo
